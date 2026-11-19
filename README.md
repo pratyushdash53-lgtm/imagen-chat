@@ -25,12 +25,9 @@ Download the latest `imagen-chat-*.apk` from [Releases](../../releases) and open
 ## Build
 
 Pushes and pull requests build an APK in GitHub Actions (see the run's artifacts).
-Pushing a tag publishes a release:
 
-```bash
-git tag v1.0.0
-git push origin v1.0.0
-```
+To release, bump the number in `VERSION` and merge to `main`: Actions builds the APK and publishes a
+GitHub Release `v<VERSION>` with the APK attached. Pushing a `v*` tag does the same.
 
 Locally: `./gradlew assembleRelease` (JDK 17 and the Android SDK).
 
