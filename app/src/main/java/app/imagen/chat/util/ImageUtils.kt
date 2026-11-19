@@ -4,6 +4,8 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.ImageDecoder
+import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
 import androidx.core.content.FileProvider
@@ -123,6 +125,24 @@ object ImageUtils {
         abs(((a shr 8) and 0xFF) - ((b shr 8) and 0xFF)),
         abs((a and 0xFF) - (b and 0xFF)),
     )
+
+    /** Copies a picked image into [dest] as an upright PNG no larger than [maxEdge] px. */
+    fun importReference(context: Context, uri: Uri, dest: File, maxEdge: Int = 2048): Boolean = runCatching {
+        val source = ImageDecoder.createSource(context.contentResolver, uri)
+        val bitmap = ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+            decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+            val longest = maxOf(info.size.width, info.size.height)
+            if (longest > maxEdge) {
+                val scale = maxEdge.toFloat() / longest
+                decoder.setTargetSize(
+                    (info.size.width * scale).toInt().coerceAtLeast(1),
+                    (info.size.height * scale).toInt().coerceAtLeast(1),
+                )
+            }
+        }
+        savePng(bitmap, dest)
+        true
+    }.getOrDefault(false)
 
     fun savePng(bitmap: Bitmap, file: File) {
         FileOutputStream(file).use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }

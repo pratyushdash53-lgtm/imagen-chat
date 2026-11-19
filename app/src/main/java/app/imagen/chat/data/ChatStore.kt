@@ -49,7 +49,10 @@ class ChatStore(context: Context) {
     }
 
     fun delete(id: String) {
-        load(id)?.messages?.forEach { m -> m.imageFile?.let { imageFile(it).delete() } }
+        load(id)?.messages?.forEach { m ->
+            m.imageFile?.let { imageFile(it).delete() }
+            m.refImage?.let { imageFile(it).delete() }
+        }
         File(chatsDir, "$id.json").delete()
     }
 
@@ -58,6 +61,9 @@ class ChatStore(context: Context) {
         .put("role", m.role)
         .put("text", m.text)
         .put("imageFile", m.imageFile ?: JSONObject.NULL)
+        .put("refImage", m.refImage ?: JSONObject.NULL)
+        .put("prompt", m.prompt ?: JSONObject.NULL)
+        .put("mode", m.mode ?: JSONObject.NULL)
         .put("model", m.model ?: JSONObject.NULL)
         .put("width", m.width)
         .put("height", m.height)
@@ -72,6 +78,9 @@ class ChatStore(context: Context) {
         role = o.getString("role"),
         text = o.optString("text"),
         imageFile = o.optStringOrNull("imageFile"),
+        refImage = o.optStringOrNull("refImage"),
+        prompt = o.optStringOrNull("prompt"),
+        mode = o.optStringOrNull("mode"),
         model = o.optStringOrNull("model"),
         width = o.optInt("width"),
         height = o.optInt("height"),
@@ -83,5 +92,5 @@ class ChatStore(context: Context) {
     )
 
     private fun JSONObject.optStringOrNull(key: String): String? =
-        if (isNull(key)) null else getString(key)
+        if (!has(key) || isNull(key)) null else getString(key)
 }
