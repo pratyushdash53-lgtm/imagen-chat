@@ -1,8 +1,16 @@
 package app.imagen.chat.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.ui.layout.ContentScale
+import java.io.File
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -79,6 +87,10 @@ fun ChatScreen(
 ) {
     var draft by remember { mutableStateOf("") }
     var viewing by remember { mutableStateOf<ChatMessage?>(null) }
+    var renaming by remember { mutableStateOf(false) }
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        if (uri != null) vm.attachReference(uri)
+    }
     val listState = rememberLazyListState()
     val itemCount = vm.messages.size + if (vm.generating) 1 else 0
 
@@ -98,6 +110,7 @@ fun ChatScreen(
             subtitle = if (vm.settings.model == "auto") "Auto model" else vm.settings.model,
             onMenu = onMenu,
             onNew = { vm.newChat() },
+            onTitle = { if (vm.messages.isNotEmpty()) renaming = true },
         )
 
         Box(Modifier.weight(1f).fillMaxWidth()) {
@@ -141,6 +154,11 @@ fun ChatScreen(
             onTransparent = { vm.transparent = it },
             aspectLabel = vm.aspect.label,
             onAspect = { vm.aspect = vm.aspect.next() },
+            reference = vm.reference?.let { vm.imageFile(it) },
+            onAttach = {
+                picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+            },
+            onRemoveReference = { vm.clearReference() },
             generating = vm.generating,
             onSend = {
                 val ok = vm.send(draft)
@@ -153,10 +171,18 @@ fun ChatScreen(
     viewing?.let { message ->
         Viewer(vm = vm, message = message, onDismiss = { viewing = null })
     }
+
+    if (renaming) {
+        RenameDialog(
+            initial = vm.title,
+            onConfirm = { vm.rename(vm.currentId, it) },
+            onDismiss = { renaming = false },
+        )
+    }
 }
 
 @Composable
-private fun TopBar(title: String, subtitle: String, onMenu: () -> Unit, onNew: () -> Unit) {
+private fun TopBar(title: String, subtitle: String, onMenu: () -> Unit, onNew: () -> Unit, onTitle: () -> Unit) {
     Row(
         Modifier
             .fillMaxWidth()
@@ -166,7 +192,7 @@ private fun TopBar(title: String, subtitle: String, onMenu: () -> Unit, onNew: (
         IconButton(onClick = onMenu) {
             Icon(Icons.Default.Menu, contentDescription = "History")
         }
-        Column(Modifier.weight(1f)) {
+        Column(Modifier.weight(1f).clickable(onClick = onTitle)) {
             Text(
                 title,
                 style = MaterialTheme.typography.titleMedium,
@@ -247,11 +273,18 @@ private fun MessageItem(vm: ChatViewModel, message: ChatMessage, onOpen: () -> U
                 color = MaterialTheme.colorScheme.primaryContainer,
                 modifier = Modifier.widthIn(max = 320.dp),
             ) {
-                Text(
-                    message.text,
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-                    color = MaterialTheme.colorScheme.onPrimaryContainer,
-                )
+                Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                    message.refImage?.let { name ->
+                        PictureBox(
+                            file = vm.imageFile(name),
+                            hasAlpha = true,
+                            ratio = 1f,
+                            corner = 12.dp,
+                            modifier = Modifier.padding(bottom = 8.dp).size(132.dp),
+                        )
+                    }
+                    Text(message.text, color = MaterialTheme.colorScheme.onPrimaryContainer)
+                }
             }
         }
         return
@@ -290,8 +323,19 @@ private fun MessageItem(vm: ChatViewModel, message: ChatMessage, onOpen: () -> U
             verticalAlignment = Alignment.CenterVertically,
         ) {
             SmallPill("${message.width}×${message.height}")
+            if (message.mode == "edit") SmallPill("Edited")
             if (message.hasAlpha) SmallPill("Transparent")
             if (message.backgroundRemoved) SmallPill("Cut out locally")
+        }
+        message.prompt?.let {
+            Text(
+                it,
+                modifier = Modifier.padding(top = 6.dp).widthIn(max = 340.dp),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
         message.warning?.let {
             Text(
@@ -311,6 +355,7 @@ private fun MessageItem(vm: ChatViewModel, message: ChatMessage, onOpen: () -> U
                 Spacer(Modifier.size(6.dp))
                 Text("Share")
             }
+            TextButton(onClick = { vm.useAsReference(message) }, enabled = !vm.generating) { Text("Edit") }
         }
     }
 }
@@ -368,6 +413,9 @@ private fun Composer(
     onTransparent: (Boolean) -> Unit,
     aspectLabel: String,
     onAspect: () -> Unit,
+    reference: File?,
+    onAttach: () -> Unit,
+    onRemoveReference: () -> Unit,
     generating: Boolean,
     onSend: () -> Unit,
     onCancel: () -> Unit,
@@ -382,6 +430,42 @@ private fun Composer(
         shadowElevation = 2.dp,
     ) {
         Column(Modifier.padding(start = 6.dp, end = 8.dp, top = 4.dp, bottom = 8.dp)) {
+            if (reference != null) {
+                val thumb = rememberBitmap(reference)
+                Box(Modifier.padding(start = 10.dp, top = 8.dp)) {
+                    Box(
+                        Modifier
+                            .size(64.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                            .checkerboard(cell = 8.dp),
+                    ) {
+                        if (thumb != null) {
+                            Image(
+                                bitmap = thumb,
+                                contentDescription = "Reference image",
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize(),
+                            )
+                        }
+                    }
+                    Box(
+                        Modifier
+                            .align(Alignment.TopEnd)
+                            .size(22.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f))
+                            .clickable(onClick = onRemoveReference),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.Default.Close,
+                            contentDescription = "Remove reference",
+                            tint = MaterialTheme.colorScheme.surface,
+                            modifier = Modifier.size(14.dp),
+                        )
+                    }
+                }
+            }
             TextField(
                 value = text,
                 onValueChange = onText,
@@ -401,16 +485,30 @@ private fun Composer(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                FilterChip(
-                    selected = transparent,
-                    onClick = { onTransparent(!transparent) },
-                    label = { Text("Transparent") },
-                    leadingIcon = if (transparent) {
-                        { Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp)) }
-                    } else null,
-                )
-                AssistChip(onClick = onAspect, label = { Text(aspectLabel) })
-                Spacer(Modifier.weight(1f))
+                Row(
+                    Modifier
+                        .weight(1f)
+                        .horizontalScroll(rememberScrollState()),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    AssistChip(
+                        onClick = onAttach,
+                        label = { Text(if (reference != null) "Change image" else "Image") },
+                        leadingIcon = {
+                            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                        },
+                    )
+                    FilterChip(
+                        selected = transparent,
+                        onClick = { onTransparent(!transparent) },
+                        label = { Text("Transparent") },
+                        leadingIcon = if (transparent) {
+                            { Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp)) }
+                        } else null,
+                    )
+                    AssistChip(onClick = onAspect, label = { Text(aspectLabel) })
+                }
                 val canSend = generating || text.isNotBlank()
                 Box(
                     Modifier

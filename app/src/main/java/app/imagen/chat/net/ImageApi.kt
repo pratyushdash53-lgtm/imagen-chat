@@ -8,18 +8,25 @@ import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.IOException
 import java.net.SocketTimeoutException
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+
+/** What the context model decided: edit the previous/attached image or make a new one. */
+class Plan(val mode: String, val prompt: String, val title: String?)
 
 /** Error whose message is always safe to show to the user. */
 class ApiException(message: String) : Exception(message)
@@ -133,6 +140,165 @@ object ImageApi {
             .url("${normalizeBase(baseUrl)}/images/generations")
             .header("Authorization", "Bearer $apiKey")
             .post(body.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        guarded {
+            client.newCall(request).await().use { response ->
+                val text = response.body?.string().orEmpty()
+                if (!response.isSuccessful) throw httpError(response.code, text, apiKey)
+                val item = try {
+                    JSONObject(text).getJSONArray("data").getJSONObject(0)
+                } catch (e: Exception) {
+                    throw ApiException("The provider returned an empty image response.")
+                }
+                val encoded = item.optString("b64_json")
+                val url = item.optString("url")
+                when {
+                    encoded.isNotBlank() -> try {
+                        Base64.decode(encoded, Base64.DEFAULT)
+                    } catch (e: IllegalArgumentException) {
+                        throw ApiException("The provider returned invalid image data.")
+                    }
+                    url.isNotBlank() -> download(url)
+                    else -> throw ApiException("The provider returned no image data.")
+                }
+            }
+        }
+    }
+
+    // ---- chat context ---------------------------------------------------
+
+    val CONTEXT_PREFERENCE = "gpt-6.1-sol"
+    private val NOT_CHAT = Regex("embed|whisper|tts|audio|moderation|realtime|transcribe|speech|rerank", RegexOption.IGNORE_CASE)
+    private val CHAT_FAMILY = Regex("^(gpt|claude|gemini|llama|qwen|deepseek|mistral|o\\d)", RegexOption.IGNORE_CASE)
+    private val EDITISH = Regex(
+        "\\b(remove|without|no|don'?t|do not|make it|make the|change|add|replace|instead|same|keep|but|" +
+            "less|more|bigger|smaller|darker|lighter|brighter|fix|adjust|turn|now)\\b",
+        RegexOption.IGNORE_CASE,
+    )
+
+    fun isChatModel(id: String) = !isCandidate(id) && !NOT_CHAT.containsMatchIn(id)
+
+    /** Picks gpt-6.1-sol when listed, otherwise the first general-purpose text model. */
+    fun chooseContext(ids: List<String>): String? =
+        ids.firstOrNull { it == CONTEXT_PREFERENCE }
+            ?: ids.firstOrNull { it.startsWith(CONTEXT_PREFERENCE) }
+            ?: ids.firstOrNull { isChatModel(it) && CHAT_FAMILY.containsMatchIn(it) }
+
+    /** Offline guess used when no context model is available. */
+    fun looksLikeEdit(message: String) = message.length < 140 && EDITISH.containsMatchIn(message)
+
+    private val PLANNER_PROMPT = """
+You are the prompt planner inside an image-generation chat app. You receive the conversation so far and the user's newest message. Reply with ONLY one JSON object, no prose and no code fences:
+{"mode": "edit" or "new", "prompt": "...", "title": "..."}
+
+Rules:
+- mode "edit": the user wants to change, refine or continue the most recent image (for example "remove the outline", "make it bluer", "same but with a hat"), or they attached a reference image to build on. Only use "edit" when a previous image exists or a reference image is attached.
+- mode "new": the user wants a different, unrelated image.
+- prompt: a complete, self-contained instruction for the image model. For "edit", state the requested change clearly AND say that everything else (subject, pose, composition, colours, style) must stay the same. For "new", write a full standalone prompt. Carry over style, subject and constraints from earlier turns unless the user changes them. Never refer to the conversation or to "the previous image" in a "new" prompt.
+- title: a short chat title of at most 5 words describing the subject.
+""".trimIndent()
+
+    /** Asks the context model what to do with the newest message. Null on any failure. */
+    suspend fun plan(
+        baseUrl: String,
+        apiKey: String,
+        model: String,
+        history: List<String>,
+        message: String,
+        hasPreviousImage: Boolean,
+        hasAttachment: Boolean,
+    ): Plan? = withContext(Dispatchers.IO) {
+        try {
+            val user = buildString {
+                append("Conversation so far:\n")
+                append(if (history.isEmpty()) "(no earlier messages)" else history.joinToString("\n"))
+                append("\n\nA previous generated image exists: ").append(if (hasPreviousImage) "yes" else "no")
+                append("\nThe user attached a reference image to the newest message: ").append(if (hasAttachment) "yes" else "no")
+                append("\n\nNewest user message:\n").append(message)
+            }
+            val body = JSONObject()
+                .put("model", model)
+                .put(
+                    "messages",
+                    JSONArray()
+                        .put(JSONObject().put("role", "system").put("content", PLANNER_PROMPT))
+                        .put(JSONObject().put("role", "user").put("content", user)),
+                )
+            val request = Request.Builder()
+                .url("${normalizeBase(baseUrl)}/chat/completions")
+                .header("Authorization", "Bearer $apiKey")
+                .post(body.toString().toRequestBody("application/json".toMediaType()))
+                .build()
+            planner.newCall(request).await().use { response ->
+                val text = response.body?.string().orEmpty()
+                if (!response.isSuccessful) null
+                else parsePlan(contentOf(text), hasPreviousImage || hasAttachment)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private val planner: OkHttpClient by lazy {
+        client.newBuilder().readTimeout(90, TimeUnit.SECONDS).build()
+    }
+
+    private fun contentOf(responseText: String): String {
+        val message = JSONObject(responseText).getJSONArray("choices").getJSONObject(0).getJSONObject("message")
+        return when (val content = message.opt("content")) {
+            is String -> content
+            is JSONArray -> buildString {
+                for (i in 0 until content.length()) append(content.optJSONObject(i)?.optString("text").orEmpty())
+            }
+            else -> ""
+        }
+    }
+
+    private fun parsePlan(content: String, canEdit: Boolean): Plan? {
+        val start = content.indexOf('{')
+        val end = content.lastIndexOf('}')
+        if (start < 0 || end <= start) return null
+        val o = JSONObject(content.substring(start, end + 1))
+        val prompt = o.optString("prompt").trim()
+        if (prompt.isEmpty()) return null
+        val mode = if (o.optString("mode").equals("edit", ignoreCase = true) && canEdit) "edit" else "new"
+        val title = o.optString("title").trim().trim('"').takeIf { it.isNotEmpty() && !it.equals("null", true) }
+        return Plan(mode, prompt, title)
+    }
+
+    // ---- image edits ----------------------------------------------------
+
+    /** Edits (or builds on) a reference image via /images/edits and returns the encoded result. */
+    suspend fun edit(
+        baseUrl: String,
+        apiKey: String,
+        model: String,
+        prompt: String,
+        size: String,
+        quality: String,
+        transparent: Boolean,
+        image: File,
+    ): ByteArray = withContext(Dispatchers.IO) {
+        if (apiKey.isBlank()) throw ApiException("Enter your API key in Settings.")
+        val profile = profile(model)
+        val form = MultipartBody.Builder().setType(MultipartBody.FORM)
+            .addFormDataPart("model", model)
+            .addFormDataPart("prompt", if (transparent) "$prompt\n$TRANSPARENT_HINT" else prompt)
+        if (profile == "gateway" || profile == "gpt-image") {
+            form.addFormDataPart("size", size)
+                .addFormDataPart("quality", quality)
+                .addFormDataPart("output_format", "png")
+            if (transparent && profile == "gpt-image") form.addFormDataPart("background", "transparent")
+        } else if (size != "auto") {
+            form.addFormDataPart("size", size)
+        }
+        form.addFormDataPart("image", image.name, image.asRequestBody("image/png".toMediaType()))
+        val request = Request.Builder()
+            .url("${normalizeBase(baseUrl)}/images/edits")
+            .header("Authorization", "Bearer $apiKey")
+            .post(form.build())
             .build()
         guarded {
             client.newCall(request).await().use { response ->

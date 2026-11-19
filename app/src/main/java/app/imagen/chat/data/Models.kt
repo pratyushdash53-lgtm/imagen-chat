@@ -17,6 +17,8 @@ data class AppSettings(
     val model: String = "auto",
     val quality: String = "auto",
     val transparentDefault: Boolean = false,
+    /** Text model that reads the chat so follow-ups keep context: "auto", "off" or a model ID. */
+    val contextModel: String = "auto",
 ) {
     val isConfigured: Boolean get() = baseUrl.isNotBlank() && apiKey.isNotBlank()
 }
@@ -26,6 +28,11 @@ data class ChatMessage(
     val role: String, // "user" or "assistant"
     val text: String = "",
     val imageFile: String? = null,
+    /** User messages: reference image attached to this message. */
+    val refImage: String? = null,
+    /** Assistant messages: the full prompt actually sent, and whether it edited an image. */
+    val prompt: String? = null,
+    val mode: String? = null, // "edit" or "new"
     val model: String? = null,
     val width: Int = 0,
     val height: Int = 0,

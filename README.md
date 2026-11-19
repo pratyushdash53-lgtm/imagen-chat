@@ -11,6 +11,10 @@ It looks and feels like a chat: describe an image, get the image back as the rep
 - **Transparent PNGs**: sends the right parameters per model family
   (`background: transparent` for `gpt-image-*`), verifies real alpha, and falls back to a local
   cut-out when the provider returns a plain backdrop. Transparent results sit on a checkerboard
+- **Chat memory**: a text model (`gpt-6.1-sol` when your provider has it, or any you choose) reads the
+  conversation so follow-ups like "remove the outline" edit the previous image instead of starting over
+- **Reference images**: attach a photo, or tap Edit on any result, and the app uses the `/images/edits` endpoint
+- **Rename chats** from the history menu or by tapping the title
 - **Generating animation**: an aurora card with live status while the image is made
 - Save to `Pictures/ImagenChat`, share, full-screen view, retry on error
 

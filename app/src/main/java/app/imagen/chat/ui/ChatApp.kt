@@ -18,9 +18,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -55,6 +59,7 @@ fun ChatApp(vm: ChatViewModel) {
     val scope = rememberCoroutineScope()
     var showSettings by rememberSaveable { mutableStateOf(false) }
     var pendingDelete by remember { mutableStateOf<ConversationSummary?>(null) }
+    var pendingRename by remember { mutableStateOf<ConversationSummary?>(null) }
     val snackbar = remember { SnackbarHostState() }
 
     LaunchedEffect(vm.notice) {
@@ -83,6 +88,7 @@ fun ChatApp(vm: ChatViewModel) {
                     scope.launch { drawerState.close() }
                 },
                 onDelete = { pendingDelete = it },
+                onRename = { pendingRename = it },
                 onSettings = {
                     showSettings = true
                     scope.launch { drawerState.close() }
@@ -114,6 +120,14 @@ fun ChatApp(vm: ChatViewModel) {
         }
     }
 
+    pendingRename?.let { item ->
+        RenameDialog(
+            initial = item.title,
+            onConfirm = { vm.rename(item.id, it) },
+            onDismiss = { pendingRename = null },
+        )
+    }
+
     pendingDelete?.let { item ->
         AlertDialog(
             onDismissRequest = { pendingDelete = null },
@@ -136,6 +150,7 @@ private fun HistoryDrawer(
     onNew: () -> Unit,
     onOpen: (String) -> Unit,
     onDelete: (ConversationSummary) -> Unit,
+    onRename: (ConversationSummary) -> Unit,
     onSettings: () -> Unit,
 ) {
     ModalDrawerSheet {
@@ -194,8 +209,28 @@ private fun HistoryDrawer(
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
                             }
-                            IconButton(onClick = { onDelete(item) }) {
-                                Icon(Icons.Default.Delete, contentDescription = "Delete chat", modifier = Modifier.size(18.dp))
+                            var menuOpen by remember { mutableStateOf(false) }
+                            Box {
+                                IconButton(onClick = { menuOpen = true }) {
+                                    Icon(Icons.Default.MoreVert, contentDescription = "Chat options", modifier = Modifier.size(18.dp))
+                                }
+                                DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                                    DropdownMenuItem(
+                                        text = { Text("Rename") },
+                                        onClick = {
+                                            menuOpen = false
+                                            onRename(item)
+                                        },
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Delete") },
+                                        leadingIcon = { Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(18.dp)) },
+                                        onClick = {
+                                            menuOpen = false
+                                            onDelete(item)
+                                        },
+                                    )
+                                }
                             }
                         }
                     }
@@ -226,4 +261,31 @@ private fun DrawerAction(
         icon()
         Text(label, modifier = Modifier.padding(start = 14.dp))
     }
+}
+
+@Composable
+internal fun RenameDialog(initial: String, onConfirm: (String) -> Unit, onDismiss: () -> Unit) {
+    var text by remember { mutableStateOf(initial) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Rename chat") },
+        text = {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it.take(60) },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        },
+        confirmButton = {
+            TextButton(
+                enabled = text.isNotBlank(),
+                onClick = {
+                    onConfirm(text)
+                    onDismiss()
+                },
+            ) { Text("Save") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }

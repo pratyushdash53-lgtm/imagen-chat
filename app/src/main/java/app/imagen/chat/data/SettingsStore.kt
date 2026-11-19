@@ -31,6 +31,7 @@ class SettingsStore(context: Context) {
             model = prefs.getString("model", "auto") ?: "auto",
             quality = prefs.getString("quality", "auto") ?: "auto",
             transparentDefault = prefs.getBoolean("transparent_default", false),
+            contextModel = prefs.getString("context_model", "auto") ?: "auto",
         )
     }
 
@@ -41,6 +42,7 @@ class SettingsStore(context: Context) {
             .putString("model", settings.model)
             .putString("quality", settings.quality)
             .putBoolean("transparent_default", settings.transparentDefault)
+            .putString("context_model", settings.contextModel)
             .apply()
     }
 }

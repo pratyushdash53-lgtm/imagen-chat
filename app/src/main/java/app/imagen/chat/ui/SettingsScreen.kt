@@ -55,6 +55,7 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
     var apiKey by remember { mutableStateOf(saved.apiKey) }
     var model by remember { mutableStateOf(saved.model) }
     var quality by remember { mutableStateOf(saved.quality) }
+    var contextModel by remember { mutableStateOf(saved.contextModel) }
     var transparentDefault by remember { mutableStateOf(saved.transparentDefault) }
     var showKey by remember { mutableStateOf(false) }
     var showAll by remember { mutableStateOf(false) }
@@ -76,7 +77,7 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
             }
             Text("Settings", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
             TextButton(onClick = {
-                vm.saveSettings(AppSettings(baseUrl.trim(), apiKey.trim(), model, quality, transparentDefault))
+                vm.saveSettings(AppSettings(baseUrl.trim(), apiKey.trim(), model, quality, transparentDefault, contextModel))
                 vm.transparent = transparentDefault
                 onBack()
             }) { Text("Save") }
@@ -148,6 +149,30 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
             }
 
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            SectionLabel("Chat context")
+            Text(
+                "A text model reads the conversation so follow-ups like \u201Cremove the outline\u201D edit the " +
+                    "previous image instead of starting over. Auto uses ${ImageApi.CONTEXT_PREFERENCE} when your " +
+                    "provider has it. Tap Find models above to list the others.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            val chatModels = remember(vm.allModels) { vm.allModels.filter { ImageApi.isChatModel(it) } }
+            if (vm.allModels.isNotEmpty()) {
+                Text(
+                    "Auto picks " + (ImageApi.chooseContext(vm.allModels) ?: "nothing (no text model listed)"),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            ModelRow("Auto (recommended)", contextModel == "auto") { contextModel = "auto" }
+            ModelRow("Off (each message stands alone)", contextModel == "off") { contextModel = "off" }
+            chatModels.forEach { id -> ModelRow(id, contextModel == id) { contextModel = id } }
+            if (contextModel != "auto" && contextModel != "off" && contextModel !in chatModels) {
+                ModelRow(contextModel, true) { }
+            }
+
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             SectionLabel("Image")
             Text("Quality", style = MaterialTheme.typography.labelLarge)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -173,7 +198,7 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
             Spacer(Modifier.height(8.dp))
             Button(
                 onClick = {
-                    vm.saveSettings(AppSettings(baseUrl.trim(), apiKey.trim(), model, quality, transparentDefault))
+                    vm.saveSettings(AppSettings(baseUrl.trim(), apiKey.trim(), model, quality, transparentDefault, contextModel))
                     vm.transparent = transparentDefault
                     onBack()
                 },
