@@ -1,0 +1,229 @@
+package app.imagen.chat.ui
+
+import android.text.format.DateUtils
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberDrawerState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import app.imagen.chat.ChatViewModel
+import app.imagen.chat.data.ConversationSummary
+import kotlinx.coroutines.launch
+
+@Composable
+fun ChatApp(vm: ChatViewModel) {
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val scope = rememberCoroutineScope()
+    var showSettings by rememberSaveable { mutableStateOf(false) }
+    var pendingDelete by remember { mutableStateOf<ConversationSummary?>(null) }
+    val snackbar = remember { SnackbarHostState() }
+
+    LaunchedEffect(vm.notice) {
+        vm.notice?.let {
+            snackbar.showSnackbar(it)
+            vm.notice = null
+        }
+    }
+
+    BackHandler(enabled = showSettings || drawerState.isOpen) {
+        if (drawerState.isOpen) scope.launch { drawerState.close() } else showSettings = false
+    }
+
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        gesturesEnabled = !showSettings,
+        drawerContent = {
+            HistoryDrawer(
+                vm = vm,
+                onNew = {
+                    vm.newChat()
+                    scope.launch { drawerState.close() }
+                },
+                onOpen = {
+                    vm.openConversation(it)
+                    scope.launch { drawerState.close() }
+                },
+                onDelete = { pendingDelete = it },
+                onSettings = {
+                    showSettings = true
+                    scope.launch { drawerState.close() }
+                },
+            )
+        },
+    ) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.background),
+        ) {
+            if (showSettings) {
+                SettingsScreen(vm = vm, onBack = { showSettings = false })
+            } else {
+                ChatScreen(
+                    vm = vm,
+                    onMenu = { scope.launch { drawerState.open() } },
+                    onOpenSettings = { showSettings = true },
+                )
+            }
+            SnackbarHost(
+                hostState = snackbar,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(bottom = 120.dp),
+            )
+        }
+    }
+
+    pendingDelete?.let { item ->
+        AlertDialog(
+            onDismissRequest = { pendingDelete = null },
+            title = { Text("Delete this chat?") },
+            text = { Text("“${item.title}” and its images will be removed from this device.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    vm.deleteConversation(item.id)
+                    pendingDelete = null
+                }) { Text("Delete") }
+            },
+            dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Cancel") } },
+        )
+    }
+}
+
+@Composable
+private fun HistoryDrawer(
+    vm: ChatViewModel,
+    onNew: () -> Unit,
+    onOpen: (String) -> Unit,
+    onDelete: (ConversationSummary) -> Unit,
+    onSettings: () -> Unit,
+) {
+    ModalDrawerSheet {
+        Column(Modifier.fillMaxSize()) {
+            Text(
+                "Imagen Chat",
+                style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.padding(start = 20.dp, top = 20.dp, bottom = 8.dp),
+            )
+            DrawerAction(label = "New image", onClick = onNew) {
+                Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(20.dp))
+            }
+            HorizontalDivider(
+                modifier = Modifier.padding(vertical = 8.dp),
+                color = MaterialTheme.colorScheme.outlineVariant,
+            )
+            Text(
+                "History",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp),
+            )
+            if (vm.conversations.isEmpty()) {
+                Text(
+                    "Your generated images will appear here.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
+                )
+            }
+            LazyColumn(Modifier.weight(1f)) {
+                items(vm.conversations, key = { it.id }) { item ->
+                    val selected = item.id == vm.currentId
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = if (selected) MaterialTheme.colorScheme.primaryContainer
+                        else androidx.compose.ui.graphics.Color.Transparent,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 10.dp, vertical = 2.dp)
+                            .clickable { onOpen(item.id) },
+                    ) {
+                        Row(
+                            Modifier.padding(start = 14.dp, top = 6.dp, bottom = 6.dp, end = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(item.title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(
+                                    DateUtils.getRelativeTimeSpanString(
+                                        item.updatedAt,
+                                        System.currentTimeMillis(),
+                                        DateUtils.MINUTE_IN_MILLIS,
+                                    ).toString(),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            IconButton(onClick = { onDelete(item) }) {
+                                Icon(Icons.Default.Delete, contentDescription = "Delete chat", modifier = Modifier.size(18.dp))
+                            }
+                        }
+                    }
+                }
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            DrawerAction(label = "Settings", onClick = onSettings, modifier = Modifier.navigationBarsPadding()) {
+                Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(20.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun DrawerAction(
+    label: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    icon: @Composable () -> Unit,
+) {
+    Row(
+        modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 20.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        icon()
+        Text(label, modifier = Modifier.padding(start = 14.dp))
+    }
+}
