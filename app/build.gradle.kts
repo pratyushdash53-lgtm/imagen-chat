@@ -3,8 +3,11 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-// Release signing is driven by environment variables so CI can inject a keystore.
+// Signing: CI secrets win; otherwise the bundled personal-use key. Either way every build carries the
+// SAME signature, so a new APK installs over the old one (a throwaway debug key per build caused
+// "package conflicts with an existing package").
 val keystorePath: String? = System.getenv("KEYSTORE_PATH")
+val bundledKeystore = rootProject.file("signing/imagen.jks")
 
 android {
     namespace = "app.imagen.chat"
@@ -26,17 +29,20 @@ android {
                 keyAlias = System.getenv("KEY_ALIAS")
                 keyPassword = System.getenv("KEY_PASSWORD")
             }
+        } else if (bundledKeystore.exists()) {
+            create("release") {
+                storeFile = bundledKeystore
+                storePassword = "imagenchat"
+                keyAlias = "imagen"
+                keyPassword = "imagenchat"
+            }
         }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = if (keystorePath != null) {
-                signingConfigs.getByName("release")
-            } else {
-                signingConfigs.getByName("debug")
-            }
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
 

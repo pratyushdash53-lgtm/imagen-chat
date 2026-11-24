@@ -18,12 +18,14 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import okio.BufferedSource
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.io.Reader
+import java.io.StringReader
 import java.net.ConnectException
 import java.net.NoRouteToHostException
 import java.net.SocketTimeoutException
@@ -51,6 +53,7 @@ class ApiException(
     val retryable: Boolean = false,
     val neverProcessed: Boolean = false,
     val retryAfterMs: Long? = null,
+    val httpCode: Int? = null,
 ) : Exception(message)
 
 /**
@@ -177,7 +180,8 @@ object ImageApi {
             401 -> "Authentication failed. Check your API key."
             403 -> "The provider denied this operation."
             404 -> "Model or endpoint not found. Check the URL and model."
-            408, 504, 524 -> "The provider timed out. It may still finish (and charge) it, so check before retrying."
+            408, 504, 524 -> "The provider's gateway gave up waiting (they usually cut requests off at about 100 seconds). " +
+                "Try Low or Medium quality, or a smaller size, in Settings. It may still have finished on the provider's side."
             413 -> "The image or prompt is too large for this provider."
             429 -> "Rate or quota limit reached."
             502 -> "The provider's gateway had a problem."
@@ -198,6 +202,7 @@ object ImageApi {
             retryable = retryable,
             neverProcessed = neverProcessed,
             retryAfterMs = retryAfter,
+            httpCode = code,
         )
     }
 
@@ -351,22 +356,22 @@ Rules:
     ): ByteArray = withContext(Dispatchers.IO) {
         if (apiKey.isBlank()) throw ApiException("Enter your API key in Settings.")
         val profile = profile(model)
-        val body = JSONObject()
-            .put("model", model)
-            .put("prompt", if (transparent) "$prompt\n$TRANSPARENT_HINT" else prompt)
-        if (profile == "gateway" || profile == "gpt-image") {
-            body.put("size", size).put("quality", quality).put("output_format", "png")
-            if (transparent && profile == "gpt-image") body.put("background", "transparent")
-        } else if (size != "auto") {
-            body.put("size", size)
-        }
         val url = "${normalizeBase(baseUrl)}/images/generations"
-        val payload = body.toString()
-        executeImage(apiKey) {
+        executeImage(apiKey, canStream = profile != "generic") { streaming ->
+            val body = JSONObject()
+                .put("model", model)
+                .put("prompt", if (transparent) "$prompt\n$TRANSPARENT_HINT" else prompt)
+            if (profile == "gateway" || profile == "gpt-image") {
+                body.put("size", size).put("quality", quality).put("output_format", "png")
+                if (transparent && profile == "gpt-image") body.put("background", "transparent")
+            } else if (size != "auto") {
+                body.put("size", size)
+            }
+            if (streaming) body.put("stream", true).put("partial_images", 1)
             Request.Builder()
                 .url(url)
                 .header("Authorization", "Bearer $apiKey")
-                .post(payload.toRequestBody(JSON_TYPE))
+                .post(body.toString().toRequestBody(JSON_TYPE))
                 .build()
         }
     }
@@ -385,7 +390,7 @@ Rules:
         if (apiKey.isBlank()) throw ApiException("Enter your API key in Settings.")
         val profile = profile(model)
         val url = "${normalizeBase(baseUrl)}/images/edits"
-        executeImage(apiKey) {
+        executeImage(apiKey, canStream = profile != "generic") { streaming ->
             val form = MultipartBody.Builder().setType(MultipartBody.FORM)
                 .addFormDataPart("model", model)
                 .addFormDataPart("prompt", if (transparent) "$prompt\n$TRANSPARENT_HINT" else prompt)
@@ -397,29 +402,26 @@ Rules:
             } else if (size != "auto") {
                 form.addFormDataPart("size", size)
             }
+            if (streaming) form.addFormDataPart("stream", "true").addFormDataPart("partial_images", "1")
             form.addFormDataPart("image", image.name, image.asRequestBody("image/png".toMediaType()))
             Request.Builder().url(url).header("Authorization", "Bearer $apiKey").post(form.build()).build()
         }
     }
 
-    /** Sends an image request and returns the decoded image bytes. */
-    private suspend fun executeImage(apiKey: String, build: () -> Request): ByteArray {
-        // Parse the response as a stream: image payloads are many megabytes of base64, and building a
-        // full JSON tree from them would multiply peak memory use.
-        val (encoded, link) = retrying(idempotent = false) {
-            guarded {
-                client.newCall(build()).await().use { response ->
-                    if (!response.isSuccessful) throw httpError(response, apiKey)
-                    val body = response.body ?: throw ApiException("The provider returned an empty response.")
-                    try {
-                        parseImage(body.charStream())
-                    } catch (e: IllegalStateException) {
-                        throw ApiException("The provider returned an unexpected response.")
-                    } catch (e: MalformedJsonException) {
-                        throw ApiException("The provider returned an unexpected response.")
-                    }
-                }
-            }
+    /**
+     * Sends an image request and returns the decoded image bytes.
+     *
+     * Image models can take minutes, but gateways such as Cloudflare answer HTTP 524 when no response
+     * arrives within about 100 seconds. Asking for a streamed response makes the provider reply at once
+     * and keep the connection busy, which avoids that cut-off. Providers that reject the streaming
+     * options get the same request without them.
+     */
+    private suspend fun executeImage(apiKey: String, canStream: Boolean, build: (Boolean) -> Request): ByteArray {
+        val (encoded, link) = try {
+            requestImage(apiKey, canStream, build)
+        } catch (e: ApiException) {
+            // 400/422 means the request was rejected before any work started, so resending it is safe.
+            if (canStream && (e.httpCode == 400 || e.httpCode == 422)) requestImage(apiKey, false, build) else throw e
         }
         return when {
             !encoded.isNullOrBlank() -> try {
@@ -429,6 +431,31 @@ Rules:
             }
             !link.isNullOrBlank() -> download(link)
             else -> throw ApiException("The provider returned no image data.")
+        }
+    }
+
+    private suspend fun requestImage(
+        apiKey: String,
+        streaming: Boolean,
+        build: (Boolean) -> Request,
+    ): Pair<String?, String?> = retrying(idempotent = false) {
+        guarded {
+            val call = client.newCall(build(streaming))
+            call.await().use { response ->
+                if (!response.isSuccessful) throw httpError(response, apiKey)
+                val body = response.body ?: throw ApiException("The provider returned an empty response.")
+                val eventStream = response.header("Content-Type").orEmpty().contains("event-stream", ignoreCase = true)
+                // Reading is blocking I/O, so it is wrapped to stay cancellable.
+                call.whileReading {
+                    try {
+                        if (eventStream) parseStream(body.source(), apiKey) else parseImage(body.charStream())
+                    } catch (e: IllegalStateException) {
+                        throw ApiException("The provider returned an unexpected response.")
+                    } catch (e: MalformedJsonException) {
+                        throw ApiException("The provider returned an unexpected response.")
+                    }
+                }
+            }
         }
     }
 
@@ -461,6 +488,72 @@ Rules:
         return null to null
     }
 
+    private class StreamEvent {
+        var type: String? = null
+        var b64: String? = null
+        var url: String? = null
+        var error: String? = null
+        var message: String? = null
+    }
+
+    /** Reads a server-sent-events image stream and returns the final image, skipping previews. */
+    private fun parseStream(source: BufferedSource, apiKey: String): Pair<String?, String?> {
+        while (true) {
+            val line = source.readUtf8Line() ?: break
+            if (!line.startsWith("data:")) continue
+            var offset = 5
+            while (offset < line.length && line[offset] == ' ') offset++
+            if (offset >= line.length || line.startsWith("[DONE]", offset)) continue
+            val reader = StringReader(line)
+            reader.skip(offset.toLong())
+            val event = readEvent(reader)
+
+            val problem = event.error ?: if (event.type == "error") event.message else null
+            if (problem != null) {
+                throw ApiException("The provider reported an error: " + problem.replace(apiKey, "***").take(180))
+            }
+            val type = event.type
+            val finished = type == null || type.endsWith(".completed")
+            if (finished && (!event.b64.isNullOrBlank() || !event.url.isNullOrBlank())) {
+                return event.b64 to event.url
+            }
+        }
+        throw ApiException("The connection closed before the image finished. Please retry.", retryable = true)
+    }
+
+    private fun readEvent(source: Reader): StreamEvent {
+        val event = StreamEvent()
+        JsonReader(source).use { r ->
+            r.beginObject()
+            while (r.hasNext()) {
+                when (r.nextName()) {
+                    "type" -> event.type = r.nextStringOrNull()
+                    "b64_json" -> {
+                        // Preview frames also carry b64_json; don't keep megabytes we'll throw away.
+                        if (event.type?.contains("partial") == true) r.skipValue() else event.b64 = r.nextStringOrNull()
+                    }
+                    "url" -> event.url = r.nextStringOrNull()
+                    "message" -> event.message = r.nextStringOrNull()
+                    "error" -> event.error = readErrorMessage(r)
+                    else -> r.skipValue()
+                }
+            }
+            r.endObject()
+        }
+        return event
+    }
+
+    private fun readErrorMessage(r: JsonReader): String? {
+        if (r.peek() != JsonToken.BEGIN_OBJECT) return r.nextStringOrNull()
+        var message: String? = null
+        r.beginObject()
+        while (r.hasNext()) {
+            if (r.nextName() == "message") message = r.nextStringOrNull() else r.skipValue()
+        }
+        r.endObject()
+        return message ?: "unknown error"
+    }
+
     private fun JsonReader.nextStringOrNull(): String? =
         if (peek() == JsonToken.NULL) {
             nextNull()
@@ -476,7 +569,8 @@ Rules:
         }
         return retrying(idempotent = true) {
             guarded {
-                downloader.newCall(Request.Builder().url(parsed).build()).await().use { response ->
+                val call = downloader.newCall(Request.Builder().url(parsed).build())
+                call.await().use { response ->
                     if (!response.isSuccessful) {
                         throw ApiException(
                             "Couldn't download the generated image (HTTP ${response.code}).",
@@ -485,19 +579,34 @@ Rules:
                     }
                     val stream = response.body?.byteStream()
                         ?: throw ApiException("Couldn't download the generated image.")
-                    val out = ByteArrayOutputStream()
-                    val buffer = ByteArray(64 * 1024)
-                    var total = 0L
-                    while (true) {
-                        val n = stream.read(buffer)
-                        if (n < 0) break
-                        total += n
-                        if (total > 100_000_000L) throw ApiException("The generated image is larger than 100 MB.")
-                        out.write(buffer, 0, n)
+                    call.whileReading {
+                        val out = ByteArrayOutputStream()
+                        val buffer = ByteArray(64 * 1024)
+                        var total = 0L
+                        while (true) {
+                            val n = stream.read(buffer)
+                            if (n < 0) break
+                            total += n
+                            if (total > 100_000_000L) throw ApiException("The generated image is larger than 100 MB.")
+                            out.write(buffer, 0, n)
+                        }
+                        out.toByteArray()
                     }
-                    out.toByteArray()
                 }
             }
+        }
+    }
+
+    /**
+     * Runs a blocking read of this call's body. Cancelling the coroutine cancels the call, which aborts the
+     * blocked read immediately instead of waiting for the next byte or the timeout.
+     */
+    private suspend fun <T> Call.whileReading(block: () -> T): T = suspendCancellableCoroutine { cont ->
+        cont.invokeOnCancellation { runCatching { cancel() } }
+        try {
+            cont.resume(block())
+        } catch (e: Throwable) {
+            if (cont.isActive) cont.resumeWithException(e)
         }
     }
 
