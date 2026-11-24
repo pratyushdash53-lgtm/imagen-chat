@@ -24,7 +24,25 @@ object ImageUtils {
         val hasAlpha: Boolean get() = transparentFraction > 0.002f
     }
 
+    /** Alpha statistics, measured on a copy no larger than 1024 px so huge images don't spike memory. */
     fun alphaStats(bitmap: Bitmap): AlphaStats {
+        val longest = maxOf(bitmap.width, bitmap.height)
+        if (longest <= 1024) return exactAlphaStats(bitmap)
+        val scale = 1024f / longest
+        val small = Bitmap.createScaledBitmap(
+            bitmap,
+            (bitmap.width * scale).toInt().coerceAtLeast(1),
+            (bitmap.height * scale).toInt().coerceAtLeast(1),
+            false,
+        )
+        return try {
+            exactAlphaStats(small)
+        } finally {
+            if (small !== bitmap) small.recycle()
+        }
+    }
+
+    private fun exactAlphaStats(bitmap: Bitmap): AlphaStats {
         val w = bitmap.width
         val h = bitmap.height
         val px = IntArray(w * h)

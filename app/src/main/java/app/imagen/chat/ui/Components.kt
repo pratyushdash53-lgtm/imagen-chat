@@ -73,13 +73,47 @@ fun Modifier.checkerboard(
 }
 
 @Composable
-fun rememberBitmap(file: File?): ImageBitmap? {
-    val state = produceState<ImageBitmap?>(null, file?.absolutePath) {
-        value = file?.let { f ->
-            withContext(Dispatchers.IO) { BitmapFactory.decodeFile(f.absolutePath)?.asImageBitmap() }
-        }
+fun rememberBitmap(file: File?, maxEdge: Int = 1280): ImageBitmap? {
+    val state = produceState<ImageBitmap?>(null, file?.absolutePath, maxEdge) {
+        value = file?.let { ImageCache.load(it, maxEdge) }
     }
     return state.value
+}
+
+/**
+ * Decodes images at roughly the size they are shown (never full resolution) and keeps recent
+ * ones in a memory-bounded LRU cache, so scrolling a long chat stays smooth and light on RAM.
+ */
+object ImageCache {
+    private val cache = object : android.util.LruCache<String, ImageBitmap>(
+        minOf(Runtime.getRuntime().maxMemory() / 8, 96L * 1024 * 1024).toInt(),
+    ) {
+        override fun sizeOf(key: String, value: ImageBitmap): Int = value.width * value.height * 4
+    }
+
+    suspend fun load(file: File, maxEdge: Int): ImageBitmap? {
+        val key = file.absolutePath + "|" + file.lastModified() + "|" + maxEdge
+        cache.get(key)?.let { return it }
+        val decoded = withContext(Dispatchers.IO) { decode(file, maxEdge) } ?: return null
+        cache.put(key, decoded)
+        return decoded
+    }
+
+    private fun decode(file: File, maxEdge: Int): ImageBitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(file.absolutePath, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        var sample = 1
+        while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= maxEdge) sample *= 2
+        return try {
+            BitmapFactory.decodeFile(
+                file.absolutePath,
+                BitmapFactory.Options().apply { inSampleSize = sample },
+            )?.asImageBitmap()
+        } catch (e: OutOfMemoryError) {
+            null
+        }
+    }
 }
 
 /** An image on a checkerboard (when it has transparency) with rounded corners. */
@@ -90,8 +124,9 @@ fun PictureBox(
     ratio: Float,
     modifier: Modifier = Modifier,
     corner: Dp = 20.dp,
+    maxEdge: Int = 1280,
 ) {
-    val bitmap = rememberBitmap(file)
+    val bitmap = rememberBitmap(file, maxEdge)
     val shape = RoundedCornerShape(corner)
     Box(
         modifier
