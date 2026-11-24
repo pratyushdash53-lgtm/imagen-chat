@@ -5,14 +5,19 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
-/** File-based conversation history: one JSON file per chat, PNGs under images/. */
+/**
+ * File-based conversation history: one JSON file per chat, PNGs under images/.
+ * This is the single source of truth. The UI and the background generator both
+ * change chats only through [update], which is atomic per call.
+ */
 class ChatStore(context: Context) {
     private val chatsDir = File(context.filesDir, "chats").apply { mkdirs() }
     val imagesDir = File(context.filesDir, "images").apply { mkdirs() }
+    private val lock = Any()
 
     fun imageFile(name: String) = File(imagesDir, name)
 
-    fun list(): List<ConversationSummary> =
+    fun list(): List<ConversationSummary> = synchronized(lock) {
         (chatsDir.listFiles { f -> f.extension == "json" } ?: emptyArray())
             .mapNotNull { file ->
                 runCatching {
@@ -21,8 +26,63 @@ class ChatStore(context: Context) {
                 }.getOrNull()
             }
             .sortedByDescending { it.updatedAt }
+    }
 
-    fun load(id: String): Conversation? = runCatching {
+    fun load(id: String): Conversation? = synchronized(lock) { read(id) }
+
+    /**
+     * Reads, changes and writes one chat atomically. [create] supplies the chat when it doesn't
+     * exist yet; without it a missing chat returns null and nothing is written.
+     */
+    fun update(
+        id: String,
+        create: (() -> Conversation)? = null,
+        block: (Conversation) -> Conversation,
+    ): Conversation? = synchronized(lock) {
+        val current = read(id) ?: create?.invoke() ?: return null
+        val next = block(current)
+        write(next)
+        next
+    }
+
+    fun delete(id: String) = synchronized(lock) {
+        read(id)?.messages?.forEach { m ->
+            m.imageFile?.let { imageFile(it).delete() }
+            m.refImage?.let { imageFile(it).delete() }
+        }
+        File(chatsDir, "$id.json").delete()
+        Unit
+    }
+
+    fun deleteAll() = synchronized(lock) {
+        chatsDir.listFiles()?.forEach { it.delete() }
+        imagesDir.listFiles()?.forEach { it.delete() }
+        Unit
+    }
+
+    fun sizeBytes(): Long =
+        (imagesDir.listFiles()?.sumOf { it.length() } ?: 0L) + (chatsDir.listFiles()?.sumOf { it.length() } ?: 0L)
+
+    /** Removes image files no chat refers to (abandoned uploads, deleted chats), keeping very recent ones. */
+    fun cleanOrphans() = synchronized(lock) {
+        val referenced = hashSetOf<String>()
+        (chatsDir.listFiles { f -> f.extension == "json" } ?: emptyArray()).forEach { file ->
+            val id = file.nameWithoutExtension
+            read(id)?.messages?.forEach { m ->
+                m.imageFile?.let { referenced.add(it) }
+                m.refImage?.let { referenced.add(it) }
+            }
+        }
+        val cutoff = System.currentTimeMillis() - 3_600_000L
+        imagesDir.listFiles()?.forEach { f ->
+            if (f.name !in referenced && f.lastModified() < cutoff) f.delete()
+        }
+        Unit
+    }
+
+    // ---- storage format -------------------------------------------------
+
+    private fun read(id: String): Conversation? = runCatching {
         val o = JSONObject(File(chatsDir, "$id.json").readText())
         val arr = o.getJSONArray("messages")
         Conversation(
@@ -30,14 +90,16 @@ class ChatStore(context: Context) {
             title = o.getString("title"),
             updatedAt = o.getLong("updatedAt"),
             messages = (0 until arr.length()).map { messageFrom(arr.getJSONObject(it)) },
+            pending = o.optBoolean("pending", false),
         )
     }.getOrNull()
 
-    fun save(conversation: Conversation) {
+    private fun write(conversation: Conversation) {
         val o = JSONObject()
             .put("id", conversation.id)
             .put("title", conversation.title)
             .put("updatedAt", conversation.updatedAt)
+            .put("pending", conversation.pending)
             .put("messages", JSONArray().apply { conversation.messages.forEach { put(messageTo(it)) } })
         val target = File(chatsDir, "${conversation.id}.json")
         val temp = File(chatsDir, "${conversation.id}.json.tmp")
@@ -46,14 +108,6 @@ class ChatStore(context: Context) {
             target.writeText(o.toString())
             temp.delete()
         }
-    }
-
-    fun delete(id: String) {
-        load(id)?.messages?.forEach { m ->
-            m.imageFile?.let { imageFile(it).delete() }
-            m.refImage?.let { imageFile(it).delete() }
-        }
-        File(chatsDir, "$id.json").delete()
     }
 
     private fun messageTo(m: ChatMessage) = JSONObject()

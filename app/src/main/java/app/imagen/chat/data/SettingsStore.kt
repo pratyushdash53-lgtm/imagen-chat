@@ -35,6 +35,13 @@ class SettingsStore(context: Context) {
         )
     }
 
+    /** Whether we've already asked for notification permission (we ask once, in context). */
+    var notificationsAsked: Boolean
+        get() = prefs.getBoolean("notifications_asked", false)
+        set(value) {
+            prefs.edit().putBoolean("notifications_asked", value).apply()
+        }
+
     fun save(settings: AppSettings) {
         prefs.edit()
             .putString("base_url", settings.baseUrl)
