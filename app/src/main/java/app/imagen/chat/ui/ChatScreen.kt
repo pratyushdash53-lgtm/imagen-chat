@@ -1,6 +1,10 @@
 package app.imagen.chat.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.core.content.ContextCompat
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
@@ -91,6 +95,8 @@ fun ChatScreen(
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         if (uri != null) vm.attachReference(uri)
     }
+    val context = LocalContext.current
+    val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
     val listState = rememberLazyListState()
     val itemCount = vm.messages.size + if (vm.generating) 1 else 0
 
@@ -161,6 +167,13 @@ fun ChatScreen(
             onRemoveReference = { vm.clearReference() },
             generating = vm.generating,
             onSend = {
+                // Ask once, right when it becomes useful: "tell me when it's done".
+                if (Build.VERSION.SDK_INT >= 33 && vm.settings.isConfigured &&
+                    ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+                    PackageManager.PERMISSION_GRANTED && vm.shouldAskNotifications()
+                ) {
+                    notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+                }
                 val ok = vm.send(draft)
                 if (ok) draft = "" else onOpenSettings()
             },
@@ -380,6 +393,7 @@ private fun Viewer(vm: ChatViewModel, message: ChatMessage, onDismiss: () -> Uni
                 hasAlpha = message.hasAlpha,
                 ratio = 1f,
                 corner = 12.dp,
+                maxEdge = 2048,
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(12.dp)
@@ -431,7 +445,7 @@ private fun Composer(
     ) {
         Column(Modifier.padding(start = 6.dp, end = 8.dp, top = 4.dp, bottom = 8.dp)) {
             if (reference != null) {
-                val thumb = rememberBitmap(reference)
+                val thumb = rememberBitmap(reference, 256)
                 Box(Modifier.padding(start = 10.dp, top = 8.dp)) {
                     Box(
                         Modifier

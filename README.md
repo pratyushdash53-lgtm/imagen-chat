@@ -15,6 +15,10 @@ It looks and feels like a chat: describe an image, get the image back as the rep
   conversation so follow-ups like "remove the outline" edit the previous image instead of starting over
 - **Reference images**: attach a photo, or tap Edit on any result, and the app uses the `/images/edits` endpoint
 - **Rename chats** from the history menu or by tapping the title
+- **Works in the background**: generation runs in a foreground service, so leaving the app no longer cuts
+  the request, and you get a notification (with a preview) when the image is ready or fails
+- **Robust networking**: safe automatic retries with backoff (never a risky double charge), offline detection,
+  streamed responses, memory-friendly image loading
 - **Generating animation**: an aurora card with live status while the image is made
 - Save to `Pictures/ImagenChat`, share, full-screen view, retry on error
 
