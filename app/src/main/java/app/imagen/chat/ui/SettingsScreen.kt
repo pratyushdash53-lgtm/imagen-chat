@@ -20,6 +20,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
@@ -59,6 +60,8 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
     var transparentDefault by remember { mutableStateOf(saved.transparentDefault) }
     var showKey by remember { mutableStateOf(false) }
     var showAll by remember { mutableStateOf(false) }
+    var storage by remember { mutableStateOf(vm.storageBytes()) }
+    var confirmClear by remember { mutableStateOf(false) }
 
     val shown = remember(vm.allModels, showAll) {
         if (showAll) vm.allModels else vm.allModels.filter { ImageApi.isCandidate(it) }
@@ -194,6 +197,29 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
                     )
                 }
                 Switch(checked = transparentDefault, onCheckedChange = { transparentDefault = it })
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            SectionLabel("Storage")
+            Text(
+                "Chats and images use " + "%.1f".format(storage / 1_048_576.0) + " MB on this device.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            OutlinedButton(onClick = { confirmClear = true }) { Text("Delete all chats") }
+            if (confirmClear) {
+                AlertDialog(
+                    onDismissRequest = { confirmClear = false },
+                    title = { Text("Delete all chats?") },
+                    text = { Text("Every chat and generated image will be removed from this device. This can't be undone.") },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            vm.clearAll()
+                            storage = vm.storageBytes()
+                            confirmClear = false
+                        }) { Text("Delete everything") }
+                    },
+                    dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("Cancel") } },
+                )
             }
             Spacer(Modifier.height(8.dp))
             Button(

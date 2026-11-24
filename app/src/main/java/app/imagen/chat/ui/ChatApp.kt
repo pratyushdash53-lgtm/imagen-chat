@@ -200,7 +200,7 @@ private fun HistoryDrawer(
                             Column(Modifier.weight(1f)) {
                                 Text(item.title, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 Text(
-                                    DateUtils.getRelativeTimeSpanString(
+                                    if (vm.running.containsKey(item.id)) "Generating\u2026" else DateUtils.getRelativeTimeSpanString(
                                         item.updatedAt,
                                         System.currentTimeMillis(),
                                         DateUtils.MINUTE_IN_MILLIS,

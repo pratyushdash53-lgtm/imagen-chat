@@ -50,6 +50,8 @@ data class Conversation(
     val title: String,
     val updatedAt: Long,
     val messages: List<ChatMessage>,
+    /** True while a generation for this chat is in flight (used to recover from process death). */
+    val pending: Boolean = false,
 )
 
 data class ConversationSummary(val id: String, val title: String, val updatedAt: Long)
@@ -57,3 +59,5 @@ data class ConversationSummary(val id: String, val title: String, val updatedAt:
 fun newId(): String = UUID.randomUUID().toString()
 
 const val DEFAULT_TITLE = "New image"
+const val CANCELLED_TEXT = "Generation cancelled."
+const val INTERRUPTED_TEXT = "The app was closed before this finished. Tap Retry to try again."

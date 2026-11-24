@@ -1,7 +1,11 @@
 package app.imagen.chat.net
 
 import android.util.Base64
+import android.util.JsonReader
+import android.util.JsonToken
+import android.util.MalformedJsonException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import okhttp3.Call
@@ -19,20 +23,38 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
+import java.io.Reader
+import java.net.ConnectException
+import java.net.NoRouteToHostException
 import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLException
+import javax.net.ssl.SSLHandshakeException
 import kotlin.coroutines.cancellation.CancellationException
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlin.random.Random
 
 /** What the context model decided: edit the previous/attached image or make a new one. */
 class Plan(val mode: String, val prompt: String, val title: String?)
 
-/** Error whose message is always safe to show to the user. */
-class ApiException(message: String) : Exception(message)
+/**
+ * Error whose message is always safe to show to the user.
+ *
+ * [retryable]: repeating a read-only call (model list, planning, download) may succeed.
+ * [neverProcessed]: the provider certainly didn't start the job, so even an image request
+ * can be repeated without risking a second charge.
+ */
+class ApiException(
+    message: String,
+    val retryable: Boolean = false,
+    val neverProcessed: Boolean = false,
+    val retryAfterMs: Long? = null,
+) : Exception(message)
 
 /**
- * Minimal OpenAI-compatible client for model discovery and image generation.
+ * Minimal OpenAI-compatible client for model discovery, chat planning and image generation.
  * Request shapes follow the three profiles of the reference Python tool:
  * "gateway" (gpt-image-2.5-*), "gpt-image" (gpt-image-*) and "generic".
  */
@@ -45,23 +67,36 @@ object ImageApi {
         RegexOption.IGNORE_CASE,
     )
     private val MODEL_ID = Regex("[A-Za-z0-9_.:/-]{1,160}")
+    private val JSON_TYPE = "application/json".toMediaType()
 
     const val TRANSPARENT_HINT =
         "Use a fully transparent background with genuine alpha, no backdrop, " +
             "no checkerboard pattern, no ground plane. Leave clear transparent margins around each subject."
 
+    // One shared client: connection pooling and HTTP/2 reuse. Image models can take minutes, so the read
+    // timeout is generous; the generation itself runs in a foreground service so it isn't cut off.
     private val client: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(300, TimeUnit.SECONDS)
-        .writeTimeout(60, TimeUnit.SECONDS)
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(600, TimeUnit.SECONDS)
+        .writeTimeout(120, TimeUnit.SECONDS)
         .build()
 
-    // Used for downloading provider image URLs: never carries the API key.
-    private val downloader: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(120, TimeUnit.SECONDS)
-        .followSslRedirects(false)
-        .build()
+    private val planner: OkHttpClient by lazy {
+        client.newBuilder().readTimeout(90, TimeUnit.SECONDS).build()
+    }
+
+    // Used for downloading provider image URLs: never carries the API key and never follows redirects.
+    private val downloader: OkHttpClient by lazy {
+        client.newBuilder()
+            .readTimeout(120, TimeUnit.SECONDS)
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .addInterceptor { chain ->
+                // Belt and braces: make sure no credentials leak to storage hosts.
+                chain.proceed(chain.request().newBuilder().removeHeader("Authorization").build())
+            }
+            .build()
+    }
 
     fun isCandidate(id: String) = CANDIDATE.containsMatchIn(id)
 
@@ -75,7 +110,7 @@ object ImageApi {
         var url = raw.trim().trimEnd('/')
         if (url.isEmpty()) throw ApiException("Enter your API base URL in Settings.")
         if (!url.startsWith("http://") && !url.startsWith("https://")) url = "https://$url"
-        for (suffix in listOf("/images/generations", "/models")) {
+        for (suffix in listOf("/images/generations", "/images/edits", "/chat/completions", "/models")) {
             if (url.endsWith(suffix)) url = url.removeSuffix(suffix).trimEnd('/')
         }
         val parsed = url.toHttpUrlOrNull() ?: throw ApiException("The API URL isn't valid.")
@@ -85,28 +120,111 @@ object ImageApi {
         return url
     }
 
+    // ---- retry plumbing -------------------------------------------------
+
+    /**
+     * Repeats [block] with exponential backoff. Read-only calls ([idempotent]) are retried on any
+     * transient failure; image requests only when the provider certainly never started the job.
+     */
+    private suspend fun <T> retrying(idempotent: Boolean, attempts: Int = 3, block: suspend () -> T): T {
+        var attempt = 0
+        while (true) {
+            try {
+                return block()
+            } catch (e: ApiException) {
+                attempt++
+                val allowed = if (idempotent) e.retryable else e.neverProcessed
+                if (!allowed || attempt >= attempts) throw e
+                val exponential = minOf(8_000L, 1_000L shl (attempt - 1))
+                delay(maxOf(e.retryAfterMs ?: 0L, exponential) + Random.nextLong(0, 400))
+            }
+        }
+    }
+
+    /** Turns low-level I/O failures into friendly, correctly classified errors. */
+    private inline fun <T> guarded(block: () -> T): T = try {
+        block()
+    } catch (e: ApiException) {
+        throw e
+    } catch (e: SocketTimeoutException) {
+        if (e.message?.contains("connect", ignoreCase = true) == true) {
+            throw ApiException("Couldn't reach the provider (connection timed out).", retryable = true, neverProcessed = true)
+        }
+        throw ApiException(
+            "Request timed out. The provider may still finish (and charge) it, so check before retrying.",
+            retryable = true,
+        )
+    } catch (e: UnknownHostException) {
+        throw ApiException("Can't find that server. Check the URL and your connection.", retryable = true, neverProcessed = true)
+    } catch (e: ConnectException) {
+        throw ApiException("Couldn't connect to the provider. Check the URL and your connection.", retryable = true, neverProcessed = true)
+    } catch (e: NoRouteToHostException) {
+        throw ApiException("No route to the provider. Check your connection.", retryable = true, neverProcessed = true)
+    } catch (e: SSLHandshakeException) {
+        throw ApiException("Secure connection failed. Check the URL and your device's date and time.", neverProcessed = false)
+    } catch (e: SSLException) {
+        throw ApiException("Secure connection was interrupted.", retryable = true)
+    } catch (e: IOException) {
+        throw ApiException("Connection lost. Check your connection and retry.", retryable = true)
+    }
+
+    private fun httpError(response: Response, apiKey: String): ApiException {
+        val code = response.code
+        val body = runCatching { response.peekBody(64L * 1024).string() }.getOrDefault("")
+        val retryAfter = response.header("Retry-After")?.trim()?.toLongOrNull()?.let { (it * 1000).coerceIn(0L, 20_000L) }
+        val base = when (code) {
+            400, 422 -> "The provider rejected the request."
+            401 -> "Authentication failed. Check your API key."
+            403 -> "The provider denied this operation."
+            404 -> "Model or endpoint not found. Check the URL and model."
+            408, 504, 524 -> "The provider timed out. It may still finish (and charge) it, so check before retrying."
+            413 -> "The image or prompt is too large for this provider."
+            429 -> "Rate or quota limit reached."
+            502 -> "The provider's gateway had a problem."
+            in 500..599 -> "The provider had a server error."
+            else -> "The provider request failed."
+        }
+        // For parameter problems the provider's one-line reason is useful (e.g. unsupported size).
+        val reason = if (code == 400 || code == 413 || code == 422) {
+            runCatching { JSONObject(body).getJSONObject("error").getString("message") }.getOrNull()
+                ?.let { if (apiKey.isNotEmpty()) it.replace(apiKey, "***") else it }
+                ?.take(180)
+        } else null
+        // 429 and 503 are rejected before any work starts, so they're safe to repeat even for images.
+        val neverProcessed = code == 429 || code == 503
+        val retryable = neverProcessed || code == 500 || code == 502 || code == 504 || code == 408 || code == 524
+        return ApiException(
+            "HTTP $code: $base" + (reason?.let { " ($it)" } ?: ""),
+            retryable = retryable,
+            neverProcessed = neverProcessed,
+            retryAfterMs = retryAfter,
+        )
+    }
+
+    // ---- models ---------------------------------------------------------
+
     /** All model IDs the provider lists. */
     suspend fun listModels(baseUrl: String, apiKey: String): List<String> = withContext(Dispatchers.IO) {
         if (apiKey.isBlank()) throw ApiException("Enter your API key in Settings.")
-        val request = Request.Builder()
-            .url("${normalizeBase(baseUrl)}/models")
-            .header("Authorization", "Bearer $apiKey")
-            .build()
-        guarded {
-            client.newCall(request).await().use { response ->
-                val text = response.body?.string().orEmpty()
-                if (!response.isSuccessful) throw httpError(response.code, text, apiKey)
-                val data = try {
-                    JSONObject(text).optJSONArray("data") ?: JSONArray()
-                } catch (e: Exception) {
-                    throw ApiException("The provider returned an unexpected model list.")
+        val url = "${normalizeBase(baseUrl)}/models"
+        retrying(idempotent = true) {
+            guarded {
+                val request = Request.Builder().url(url).header("Authorization", "Bearer $apiKey").build()
+                client.newCall(request).await().use { response ->
+                    if (!response.isSuccessful) throw httpError(response, apiKey)
+                    val text = response.body?.string().orEmpty()
+                    val data = try {
+                        JSONObject(text).optJSONArray("data") ?: JSONArray()
+                    } catch (e: Exception) {
+                        throw ApiException("The provider returned an unexpected model list.")
+                    }
+                    val ids = sortedSetOf<String>()
+                    for (i in 0 until data.length()) {
+                        val id = data.optJSONObject(i)?.optString("id").orEmpty()
+                        if (MODEL_ID.matches(id) && id != apiKey) ids.add(id)
+                    }
+                    ids.toList()
                 }
-                val ids = sortedSetOf<String>()
-                for (i in 0 until data.length()) {
-                    val id = data.optJSONObject(i)?.optString("id").orEmpty()
-                    if (MODEL_ID.matches(id) && id != apiKey) ids.add(id)
-                }
-                ids.toList()
             }
         }
     }
@@ -115,59 +233,9 @@ object ImageApi {
     fun chooseAuto(ids: List<String>): String? =
         PREFERENCE.firstOrNull { it in ids } ?: ids.firstOrNull { isCandidate(it) }
 
-    /** Generates one image and returns its encoded bytes (PNG, JPEG or WebP). */
-    suspend fun generate(
-        baseUrl: String,
-        apiKey: String,
-        model: String,
-        prompt: String,
-        size: String,
-        quality: String,
-        transparent: Boolean,
-    ): ByteArray = withContext(Dispatchers.IO) {
-        if (apiKey.isBlank()) throw ApiException("Enter your API key in Settings.")
-        val profile = profile(model)
-        val body = JSONObject()
-            .put("model", model)
-            .put("prompt", if (transparent) "$prompt\n$TRANSPARENT_HINT" else prompt)
-        if (profile == "gateway" || profile == "gpt-image") {
-            body.put("size", size).put("quality", quality).put("output_format", "png")
-            if (transparent && profile == "gpt-image") body.put("background", "transparent")
-        } else if (size != "auto") {
-            body.put("size", size)
-        }
-        val request = Request.Builder()
-            .url("${normalizeBase(baseUrl)}/images/generations")
-            .header("Authorization", "Bearer $apiKey")
-            .post(body.toString().toRequestBody("application/json".toMediaType()))
-            .build()
-        guarded {
-            client.newCall(request).await().use { response ->
-                val text = response.body?.string().orEmpty()
-                if (!response.isSuccessful) throw httpError(response.code, text, apiKey)
-                val item = try {
-                    JSONObject(text).getJSONArray("data").getJSONObject(0)
-                } catch (e: Exception) {
-                    throw ApiException("The provider returned an empty image response.")
-                }
-                val encoded = item.optString("b64_json")
-                val url = item.optString("url")
-                when {
-                    encoded.isNotBlank() -> try {
-                        Base64.decode(encoded, Base64.DEFAULT)
-                    } catch (e: IllegalArgumentException) {
-                        throw ApiException("The provider returned invalid image data.")
-                    }
-                    url.isNotBlank() -> download(url)
-                    else -> throw ApiException("The provider returned no image data.")
-                }
-            }
-        }
-    }
-
     // ---- chat context ---------------------------------------------------
 
-    val CONTEXT_PREFERENCE = "gpt-6.1-sol"
+    const val CONTEXT_PREFERENCE = "gpt-6.1-sol"
     private val NOT_CHAT = Regex("embed|whisper|tts|audio|moderation|realtime|transcribe|speech|rerank", RegexOption.IGNORE_CASE)
     private val CHAT_FAMILY = Regex("^(gpt|claude|gemini|llama|qwen|deepseek|mistral|o\\d)", RegexOption.IGNORE_CASE)
     private val EDITISH = Regex(
@@ -216,33 +284,34 @@ Rules:
                 append("\nThe user attached a reference image to the newest message: ").append(if (hasAttachment) "yes" else "no")
                 append("\n\nNewest user message:\n").append(message)
             }
-            val body = JSONObject()
+            val payload = JSONObject()
                 .put("model", model)
                 .put(
                     "messages",
                     JSONArray()
                         .put(JSONObject().put("role", "system").put("content", PLANNER_PROMPT))
                         .put(JSONObject().put("role", "user").put("content", user)),
-                )
-            val request = Request.Builder()
-                .url("${normalizeBase(baseUrl)}/chat/completions")
-                .header("Authorization", "Bearer $apiKey")
-                .post(body.toString().toRequestBody("application/json".toMediaType()))
-                .build()
-            planner.newCall(request).await().use { response ->
-                val text = response.body?.string().orEmpty()
-                if (!response.isSuccessful) null
-                else parsePlan(contentOf(text), hasPreviousImage || hasAttachment)
+                ).toString()
+            val url = "${normalizeBase(baseUrl)}/chat/completions"
+            val canEdit = hasPreviousImage || hasAttachment
+            retrying(idempotent = true, attempts = 2) {
+                guarded {
+                    val request = Request.Builder()
+                        .url(url)
+                        .header("Authorization", "Bearer $apiKey")
+                        .post(payload.toRequestBody(JSON_TYPE))
+                        .build()
+                    planner.newCall(request).await().use { response ->
+                        if (!response.isSuccessful) throw httpError(response, apiKey)
+                        parsePlan(contentOf(response.body?.string().orEmpty()), canEdit)
+                    }
+                }
             }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             null
         }
-    }
-
-    private val planner: OkHttpClient by lazy {
-        client.newBuilder().readTimeout(90, TimeUnit.SECONDS).build()
     }
 
     private fun contentOf(responseText: String): String {
@@ -268,7 +337,39 @@ Rules:
         return Plan(mode, prompt, title)
     }
 
-    // ---- image edits ----------------------------------------------------
+    // ---- images ---------------------------------------------------------
+
+    /** Generates one image and returns its encoded bytes (PNG, JPEG or WebP). */
+    suspend fun generate(
+        baseUrl: String,
+        apiKey: String,
+        model: String,
+        prompt: String,
+        size: String,
+        quality: String,
+        transparent: Boolean,
+    ): ByteArray = withContext(Dispatchers.IO) {
+        if (apiKey.isBlank()) throw ApiException("Enter your API key in Settings.")
+        val profile = profile(model)
+        val body = JSONObject()
+            .put("model", model)
+            .put("prompt", if (transparent) "$prompt\n$TRANSPARENT_HINT" else prompt)
+        if (profile == "gateway" || profile == "gpt-image") {
+            body.put("size", size).put("quality", quality).put("output_format", "png")
+            if (transparent && profile == "gpt-image") body.put("background", "transparent")
+        } else if (size != "auto") {
+            body.put("size", size)
+        }
+        val url = "${normalizeBase(baseUrl)}/images/generations"
+        val payload = body.toString()
+        executeImage(apiKey) {
+            Request.Builder()
+                .url(url)
+                .header("Authorization", "Bearer $apiKey")
+                .post(payload.toRequestBody(JSON_TYPE))
+                .build()
+        }
+    }
 
     /** Edits (or builds on) a reference image via /images/edits and returns the encoded result. */
     suspend fun edit(
@@ -283,96 +384,121 @@ Rules:
     ): ByteArray = withContext(Dispatchers.IO) {
         if (apiKey.isBlank()) throw ApiException("Enter your API key in Settings.")
         val profile = profile(model)
-        val form = MultipartBody.Builder().setType(MultipartBody.FORM)
-            .addFormDataPart("model", model)
-            .addFormDataPart("prompt", if (transparent) "$prompt\n$TRANSPARENT_HINT" else prompt)
-        if (profile == "gateway" || profile == "gpt-image") {
-            form.addFormDataPart("size", size)
-                .addFormDataPart("quality", quality)
-                .addFormDataPart("output_format", "png")
-            if (transparent && profile == "gpt-image") form.addFormDataPart("background", "transparent")
-        } else if (size != "auto") {
-            form.addFormDataPart("size", size)
-        }
-        form.addFormDataPart("image", image.name, image.asRequestBody("image/png".toMediaType()))
-        val request = Request.Builder()
-            .url("${normalizeBase(baseUrl)}/images/edits")
-            .header("Authorization", "Bearer $apiKey")
-            .post(form.build())
-            .build()
-        guarded {
-            client.newCall(request).await().use { response ->
-                val text = response.body?.string().orEmpty()
-                if (!response.isSuccessful) throw httpError(response.code, text, apiKey)
-                val item = try {
-                    JSONObject(text).getJSONArray("data").getJSONObject(0)
-                } catch (e: Exception) {
-                    throw ApiException("The provider returned an empty image response.")
-                }
-                val encoded = item.optString("b64_json")
-                val url = item.optString("url")
-                when {
-                    encoded.isNotBlank() -> try {
-                        Base64.decode(encoded, Base64.DEFAULT)
-                    } catch (e: IllegalArgumentException) {
-                        throw ApiException("The provider returned invalid image data.")
-                    }
-                    url.isNotBlank() -> download(url)
-                    else -> throw ApiException("The provider returned no image data.")
-                }
+        val url = "${normalizeBase(baseUrl)}/images/edits"
+        executeImage(apiKey) {
+            val form = MultipartBody.Builder().setType(MultipartBody.FORM)
+                .addFormDataPart("model", model)
+                .addFormDataPart("prompt", if (transparent) "$prompt\n$TRANSPARENT_HINT" else prompt)
+            if (profile == "gateway" || profile == "gpt-image") {
+                form.addFormDataPart("size", size)
+                    .addFormDataPart("quality", quality)
+                    .addFormDataPart("output_format", "png")
+                if (transparent && profile == "gpt-image") form.addFormDataPart("background", "transparent")
+            } else if (size != "auto") {
+                form.addFormDataPart("size", size)
             }
+            form.addFormDataPart("image", image.name, image.asRequestBody("image/png".toMediaType()))
+            Request.Builder().url(url).header("Authorization", "Bearer $apiKey").post(form.build()).build()
         }
     }
 
-    private fun download(url: String): ByteArray {
+    /** Sends an image request and returns the decoded image bytes. */
+    private suspend fun executeImage(apiKey: String, build: () -> Request): ByteArray {
+        // Parse the response as a stream: image payloads are many megabytes of base64, and building a
+        // full JSON tree from them would multiply peak memory use.
+        val (encoded, link) = retrying(idempotent = false) {
+            guarded {
+                client.newCall(build()).await().use { response ->
+                    if (!response.isSuccessful) throw httpError(response, apiKey)
+                    val body = response.body ?: throw ApiException("The provider returned an empty response.")
+                    try {
+                        parseImage(body.charStream())
+                    } catch (e: IllegalStateException) {
+                        throw ApiException("The provider returned an unexpected response.")
+                    } catch (e: MalformedJsonException) {
+                        throw ApiException("The provider returned an unexpected response.")
+                    }
+                }
+            }
+        }
+        return when {
+            !encoded.isNullOrBlank() -> try {
+                Base64.decode(encoded, Base64.DEFAULT)
+            } catch (e: IllegalArgumentException) {
+                throw ApiException("The provider returned invalid image data.")
+            }
+            !link.isNullOrBlank() -> download(link)
+            else -> throw ApiException("The provider returned no image data.")
+        }
+    }
+
+    /** Reads `data[0].b64_json` / `data[0].url` without materialising the whole document. */
+    private fun parseImage(source: Reader): Pair<String?, String?> {
+        JsonReader(source).use { reader ->
+            reader.beginObject()
+            while (reader.hasNext()) {
+                if (reader.nextName() != "data") {
+                    reader.skipValue()
+                    continue
+                }
+                reader.beginArray()
+                var encoded: String? = null
+                var link: String? = null
+                if (reader.hasNext()) {
+                    reader.beginObject()
+                    while (reader.hasNext()) {
+                        when (reader.nextName()) {
+                            "b64_json" -> encoded = reader.nextStringOrNull()
+                            "url" -> link = reader.nextStringOrNull()
+                            else -> reader.skipValue()
+                        }
+                    }
+                    reader.endObject()
+                }
+                return encoded to link
+            }
+        }
+        return null to null
+    }
+
+    private fun JsonReader.nextStringOrNull(): String? =
+        if (peek() == JsonToken.NULL) {
+            nextNull()
+            null
+        } else {
+            nextString()
+        }
+
+    private suspend fun download(url: String): ByteArray {
         val parsed = url.toHttpUrlOrNull()
         if (parsed == null || !parsed.isHttps || parsed.username.isNotEmpty() || parsed.password.isNotEmpty()) {
             throw ApiException("The provider's image link isn't a plain HTTPS URL.")
         }
-        downloader.newCall(Request.Builder().url(parsed).build()).execute().use { response ->
-            if (!response.isSuccessful) throw ApiException("Couldn't download the generated image.")
-            val stream = response.body?.byteStream() ?: throw ApiException("Couldn't download the generated image.")
-            val out = ByteArrayOutputStream()
-            val buffer = ByteArray(64 * 1024)
-            var total = 0L
-            while (true) {
-                val n = stream.read(buffer)
-                if (n < 0) break
-                total += n
-                if (total > 100_000_000L) throw ApiException("The generated image is larger than 100 MB.")
-                out.write(buffer, 0, n)
+        return retrying(idempotent = true) {
+            guarded {
+                downloader.newCall(Request.Builder().url(parsed).build()).await().use { response ->
+                    if (!response.isSuccessful) {
+                        throw ApiException(
+                            "Couldn't download the generated image (HTTP ${response.code}).",
+                            retryable = response.code >= 500,
+                        )
+                    }
+                    val stream = response.body?.byteStream()
+                        ?: throw ApiException("Couldn't download the generated image.")
+                    val out = ByteArrayOutputStream()
+                    val buffer = ByteArray(64 * 1024)
+                    var total = 0L
+                    while (true) {
+                        val n = stream.read(buffer)
+                        if (n < 0) break
+                        total += n
+                        if (total > 100_000_000L) throw ApiException("The generated image is larger than 100 MB.")
+                        out.write(buffer, 0, n)
+                    }
+                    out.toByteArray()
+                }
             }
-            return out.toByteArray()
         }
-    }
-
-    private inline fun <T> guarded(block: () -> T): T = try {
-        block()
-    } catch (e: ApiException) {
-        throw e
-    } catch (e: SocketTimeoutException) {
-        throw ApiException("Request timed out. The provider may still finish (and charge) it, so check before retrying.")
-    } catch (e: IOException) {
-        throw ApiException("Couldn't reach the provider. Check the URL and your connection.")
-    }
-
-    private fun httpError(code: Int, body: String, apiKey: String): ApiException {
-        val base = when (code) {
-            400, 422 -> "The provider rejected the request."
-            401 -> "Authentication failed. Check your API key."
-            403 -> "The provider denied this operation."
-            404 -> "Model or endpoint not found. Check the URL and model."
-            429 -> "Rate or quota limit reached."
-            in 500..599 -> "The provider had a server error."
-            else -> "The provider request failed."
-        }
-        // For parameter problems the provider's one-line reason is useful (e.g. unsupported size).
-        val reason = if (code == 400 || code == 422) {
-            runCatching { JSONObject(body).getJSONObject("error").getString("message") }.getOrNull()
-                ?.replace(apiKey, "***")
-                ?.take(180)
-        } else null
-        return ApiException("HTTP $code: $base" + (reason?.let { " ($it)" } ?: ""))
     }
 
     private suspend fun Call.await(): Response = suspendCancellableCoroutine { cont ->
@@ -383,7 +509,7 @@ Rules:
             }
 
             override fun onResponse(call: Call, response: Response) {
-                cont.resume(response)
+                if (cont.isActive) cont.resume(response) else response.close()
             }
         })
     }

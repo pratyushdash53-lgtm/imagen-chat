@@ -1,36 +1,38 @@
 package app.imagen.chat
 
 import android.app.Application
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.net.Uri
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import app.imagen.chat.data.Aspect
 import app.imagen.chat.data.AppSettings
+import app.imagen.chat.data.Aspect
 import app.imagen.chat.data.ChatMessage
-import app.imagen.chat.data.ChatStore
 import app.imagen.chat.data.Conversation
 import app.imagen.chat.data.ConversationSummary
 import app.imagen.chat.data.DEFAULT_TITLE
-import app.imagen.chat.data.SettingsStore
 import app.imagen.chat.data.newId
+import app.imagen.chat.gen.GenParams
+import app.imagen.chat.gen.RunInfo
 import app.imagen.chat.net.ApiException
-import app.imagen.chat.net.ImageApi
 import app.imagen.chat.util.ImageUtils
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import kotlin.coroutines.cancellation.CancellationException
 
+/**
+ * Screen state only. Chats live in the store and generation runs in the app-level manager, so
+ * nothing here is lost or interrupted when the screen is destroyed or the app goes to the background.
+ */
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
-    private val settingsStore = SettingsStore(app)
-    private val chatStore = ChatStore(app)
+    private val imagen = app as ImagenApp
+    private val store = imagen.chats
+    private val settingsStore = imagen.settingsStore
+    private val manager = imagen.manager
 
     var settings by mutableStateOf(settingsStore.load())
         private set
@@ -50,12 +52,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     var reference by mutableStateOf<String?>(null)
         private set
 
-    var generating by mutableStateOf(false)
+    /** Chats with a generation in flight (any of them, not just the open one). */
+    var running by mutableStateOf<Map<String, RunInfo>>(emptyMap())
         private set
-    var stage by mutableStateOf("")
-        private set
-    var generatingAspect by mutableStateOf(Aspect.Auto)
-        private set
+
+    val generating: Boolean get() = running.containsKey(currentId)
+    val stage: String get() = running[currentId]?.stage ?: ""
+    val generatingAspect: Aspect get() = running[currentId]?.aspect ?: Aspect.Auto
 
     /** One-shot message for the snackbar. */
     var notice by mutableStateOf<String?>(null)
@@ -67,13 +70,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     var modelsError by mutableStateOf<String?>(null)
         private set
 
-    private var job: Job? = null
-    private var autoModel: String? = null
-    private var autoModelKey: String = ""
-    private var titleAuto = false
-
     init {
-        conversations = chatStore.list()
+        manager.visibleConversation = currentId
+        conversations = store.list()
+        viewModelScope.launch { manager.running.collect { running = it } }
+        viewModelScope.launch {
+            manager.changes.collect { id ->
+                conversations = store.list()
+                if (id == currentId) loadCurrent()
+            }
+        }
     }
 
     // ---- settings -------------------------------------------------------
@@ -81,7 +87,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun saveSettings(new: AppSettings) {
         settingsStore.save(new)
         settings = new
-        autoModel = null
         notice = "Settings saved"
     }
 
@@ -90,7 +95,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         modelsError = null
         viewModelScope.launch {
             try {
-                allModels = ImageApi.listModels(baseUrl, apiKey)
+                allModels = manager.models(baseUrl, apiKey, force = true)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: ApiException) {
@@ -105,52 +110,76 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** True exactly once, so we ask for notification permission in context and never nag. */
+    fun shouldAskNotifications(): Boolean {
+        if (settingsStore.notificationsAsked) return false
+        settingsStore.notificationsAsked = true
+        return true
+    }
+
     // ---- conversations --------------------------------------------------
 
+    private fun loadCurrent() {
+        val conversation = store.load(currentId) ?: return
+        messages = conversation.messages
+        title = conversation.title
+    }
+
+    private fun select(id: String) {
+        currentId = id
+        manager.visibleConversation = id
+    }
+
     fun newChat() {
-        cancelGeneration()
         clearReference()
-        currentId = newId()
+        select(newId())
         title = DEFAULT_TITLE
-        titleAuto = false
         messages = emptyList()
     }
 
     fun openConversation(id: String) {
-        if (id == currentId) return
-        cancelGeneration()
-        val loaded = chatStore.load(id) ?: return
-        clearReference()
-        currentId = loaded.id
-        title = loaded.title
-        titleAuto = false
-        messages = loaded.messages
+        if (id != currentId) {
+            clearReference()
+            select(id)
+        }
+        val conversation = store.load(id)
+        if (conversation == null) {
+            title = DEFAULT_TITLE
+            messages = emptyList()
+        } else {
+            title = conversation.title
+            messages = conversation.messages
+        }
+        conversations = store.list()
     }
 
     fun deleteConversation(id: String) {
-        chatStore.delete(id)
+        manager.cancel(id)
+        store.delete(id)
         if (id == currentId) newChat()
-        conversations = chatStore.list()
+        conversations = store.list()
     }
 
     fun rename(id: String, newTitle: String) {
         val t = newTitle.trim().take(60)
         if (t.isEmpty()) return
-        if (id == currentId) {
-            title = t
-            titleAuto = false
-        }
-        val stored = chatStore.load(id) ?: return
-        chatStore.save(stored.copy(title = t))
-        conversations = chatStore.list()
+        if (id == currentId) title = t
+        store.update(id) { it.copy(title = t) }
+        conversations = store.list()
     }
 
-    fun imageFile(name: String): File = chatStore.imageFile(name)
+    fun imageFile(name: String): File = store.imageFile(name)
 
-    private fun persist() {
-        if (messages.isEmpty()) return
-        chatStore.save(Conversation(currentId, title, System.currentTimeMillis(), messages))
-        conversations = chatStore.list()
+    // ---- storage --------------------------------------------------------
+
+    fun storageBytes(): Long = store.sizeBytes()
+
+    fun clearAll() {
+        manager.cancelAll()
+        store.deleteAll()
+        newChat()
+        conversations = store.list()
+        notice = "All chats deleted"
     }
 
     // ---- reference image ------------------------------------------------
@@ -159,7 +188,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val name = "ref_" + newId() + ".png"
             val ok = withContext(Dispatchers.IO) {
-                ImageUtils.importReference(getApplication(), uri, chatStore.imageFile(name))
+                ImageUtils.importReference(getApplication(), uri, store.imageFile(name))
             }
             if (ok) {
                 dropReferenceFile()
@@ -185,7 +214,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     // Only files the user uploaded (ref_*) are ours to delete; generated images stay.
     private fun dropReferenceFile() {
-        reference?.let { if (it.startsWith("ref_")) chatStore.imageFile(it).delete() }
+        reference?.let { if (it.startsWith("ref_")) store.imageFile(it).delete() }
     }
 
     // ---- generation -----------------------------------------------------
@@ -200,13 +229,17 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
         val attached = reference
         reference = null
-        messages = messages + ChatMessage(role = "user", text = prompt, refImage = attached)
-        if (title == DEFAULT_TITLE) {
-            title = prompt.take(48)
-            titleAuto = true
-        }
-        persist()
-        runGeneration(prompt, attached)
+        val isFirst = messages.isEmpty()
+        val autoTitle = if (isFirst) prompt.take(48) else null
+        val now = System.currentTimeMillis()
+        val userMessage = ChatMessage(role = "user", text = prompt, refImage = attached)
+        store.update(
+            currentId,
+            create = { Conversation(currentId, autoTitle ?: title, now, emptyList()) },
+        ) { it.copy(messages = it.messages + userMessage, updatedAt = now) }
+        loadCurrent()
+        conversations = store.list()
+        manager.start(currentId, params(prompt, attached, autoTitle))
         return true
     }
 
@@ -215,163 +248,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val index = messages.indexOfFirst { it.id == failed.id }
         if (index < 0) return
         val userMessage = messages.take(index).lastOrNull { it.isUser } ?: return
-        messages = messages.filterNot { it.id == failed.id }
-        persist()
-        runGeneration(userMessage.text, userMessage.refImage)
+        store.update(currentId) { c -> c.copy(messages = c.messages.filterNot { it.id == failed.id }) }
+        loadCurrent()
+        manager.start(currentId, params(userMessage.text, userMessage.refImage, null))
     }
 
-    fun cancelGeneration() {
-        job?.cancel()
-        job = null
-    }
+    fun cancelGeneration() = manager.cancel(currentId)
 
-    private fun runGeneration(prompt: String, userRef: String?) {
-        val wantTransparent = transparent
-        val size = aspect
-        val snapshot = settings
-        // Everything before the message being answered: this is the chat context.
-        val prior = messages.dropLast(1)
-        generating = true
-        generatingAspect = size
-        stage = "Reading the conversation"
-        job = viewModelScope.launch {
-            try {
-                val refFile = userRef?.let { chatStore.imageFile(it) }?.takeIf { it.isFile }
-                val previousFile = prior
-                    .lastOrNull { !it.isUser && it.imageFile != null && it.error == null }
-                    ?.imageFile?.let { chatStore.imageFile(it) }?.takeIf { it.isFile }
-
-                var mode: String
-                var finalPrompt = prompt
-                val contextModel = resolveContextModel(snapshot)
-                val plan = if (contextModel != null) {
-                    ImageApi.plan(
-                        snapshot.baseUrl, snapshot.apiKey, contextModel,
-                        transcript(prior), prompt,
-                        hasPreviousImage = previousFile != null,
-                        hasAttachment = refFile != null,
-                    )
-                } else null
-                if (plan != null) {
-                    mode = plan.mode
-                    finalPrompt = plan.prompt
-                    val suggested = plan.title?.take(48)
-                    if (titleAuto && !suggested.isNullOrBlank()) {
-                        title = suggested
-                        titleAuto = false
-                    }
-                } else {
-                    mode = if (refFile != null || (previousFile != null && ImageApi.looksLikeEdit(prompt))) "edit" else "new"
-                }
-                val base: File? = refFile ?: if (mode == "edit") previousFile else null
-
-                stage = "Finding model"
-                val model = resolveModel(snapshot)
-                stage = if (base != null) "Editing image" else "Generating image"
-                val bytes = if (base != null) {
-                    ImageApi.edit(
-                        snapshot.baseUrl, snapshot.apiKey, model, finalPrompt,
-                        size.size, snapshot.quality, wantTransparent, base,
-                    )
-                } else {
-                    ImageApi.generate(
-                        snapshot.baseUrl, snapshot.apiKey, model, finalPrompt,
-                        size.size, snapshot.quality, wantTransparent,
-                    )
-                }
-                stage = "Finishing touches"
-                val message = withContext(Dispatchers.Default) { process(bytes, model, wantTransparent) }
-                    .copy(prompt = finalPrompt, mode = if (base != null) "edit" else "new")
-                messages = messages + message
-            } catch (e: CancellationException) {
-                messages = messages + ChatMessage(role = "assistant", error = "Generation cancelled.")
-                throw e
-            } catch (e: ApiException) {
-                messages = messages + ChatMessage(role = "assistant", error = e.message ?: "Generation failed.")
-            } catch (e: Exception) {
-                messages = messages + ChatMessage(
-                    role = "assistant",
-                    error = "Something went wrong (${e.javaClass.simpleName}).",
-                )
-            } finally {
-                generating = false
-                persist()
-            }
-        }
-    }
-
-    /** Compact text history for the context model (last turns only). */
-    private fun transcript(prior: List<ChatMessage>): List<String> = prior.takeLast(12).mapNotNull { m ->
-        when {
-            m.isUser -> "User: " + m.text + if (m.refImage != null) " [attached a reference image]" else ""
-            m.imageFile != null ->
-                "Assistant: generated an image (" + (if (m.mode == "edit") "edit" else "new") +
-                    ") using the prompt: " + (m.prompt ?: "unknown")
-            else -> null
-        }
-    }
-
-    private suspend fun resolveContextModel(s: AppSettings): String? {
-        when (s.contextModel) {
-            "off" -> return null
-            "auto" -> Unit
-            else -> return s.contextModel
-        }
-        var ids = allModels
-        if (ids.isEmpty()) {
-            ids = try {
-                ImageApi.listModels(s.baseUrl, s.apiKey)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                emptyList()
-            }
-            allModels = ids
-        }
-        return ImageApi.chooseContext(ids)
-    }
-
-    private suspend fun resolveModel(s: AppSettings): String {
-        if (s.model != "auto") return s.model
-        val key = s.baseUrl + "|" + s.apiKey.hashCode()
-        autoModel?.let { if (autoModelKey == key) return it }
-        val ids = allModels.ifEmpty { ImageApi.listModels(s.baseUrl, s.apiKey).also { allModels = it } }
-        val chosen = ImageApi.chooseAuto(ids)
-            ?: throw ApiException("No image model was found at this URL. Pick one in Settings.")
-        autoModel = chosen
-        autoModelKey = key
-        return chosen
-    }
-
-    private fun process(bytes: ByteArray, model: String, wantTransparent: Boolean): ChatMessage {
-        val options = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
-        var bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
-            ?: throw ApiException("The provider's image couldn't be decoded.")
-        var warning: String? = null
-        var removed = false
-        var stats = ImageUtils.alphaStats(bitmap)
-        if (wantTransparent && !stats.borderClear) {
-            val cut = ImageUtils.removeBackground(bitmap)
-            if (cut != null) {
-                bitmap = cut
-                removed = true
-                stats = ImageUtils.alphaStats(bitmap)
-            } else {
-                warning = "The provider didn't return a transparent background, and the backdrop wasn't " +
-                    "plain enough to cut out automatically."
-            }
-        }
-        val name = newId() + ".png"
-        ImageUtils.savePng(bitmap, chatStore.imageFile(name))
-        return ChatMessage(
-            role = "assistant",
-            imageFile = name,
-            model = model,
-            width = bitmap.width,
-            height = bitmap.height,
-            hasAlpha = stats.hasAlpha,
-            backgroundRemoved = removed,
-            warning = warning,
-        )
-    }
+    private fun params(prompt: String, ref: String?, autoTitle: String?) =
+        GenParams(prompt, ref, settings, aspect, transparent, autoTitle)
 }
