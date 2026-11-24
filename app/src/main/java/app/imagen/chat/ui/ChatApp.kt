@@ -27,6 +27,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalDrawerSheet
@@ -38,6 +39,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -101,6 +103,7 @@ fun ChatApp(vm: ChatViewModel) {
                 .fillMaxSize()
                 .background(MaterialTheme.colorScheme.background),
         ) {
+            CompositionLocalProvider(LocalContentColor provides MaterialTheme.colorScheme.onBackground) {
             if (showSettings) {
                 SettingsScreen(vm = vm, onBack = { showSettings = false })
             } else {
@@ -109,6 +112,7 @@ fun ChatApp(vm: ChatViewModel) {
                     onMenu = { scope.launch { drawerState.open() } },
                     onOpenSettings = { showSettings = true },
                 )
+            }
             }
             SnackbarHost(
                 hostState = snackbar,

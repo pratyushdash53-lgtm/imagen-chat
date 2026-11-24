@@ -39,19 +39,19 @@ GitHub Release `v<VERSION>` with the APK attached. Pushing a `v*` tag does the s
 
 Locally: `./gradlew assembleRelease` (JDK 17 and the Android SDK).
 
-### Stable signing key (recommended)
+### Signing
 
-Without secrets, release APKs are signed with a throwaway debug key, so each build has a different
-signature and phones will not update one build over another. To fix that, create a keystore once and
-add these repository secrets:
+Every build is signed with the same key, so a new APK installs as an update over the old one.
+By default that is the personal-use key bundled in `signing/imagen.jks`. This repository is public, so
+that key is public too: it is meant for sideloading your own copy, **not** for publishing to an app store.
+For a private key instead, add these repository secrets and they take priority:
 
 | Secret | Value |
 | --- | --- |
-| `KEYSTORE_BASE64` | `base64 -w0 release.jks` |
+| `KEYSTORE_BASE64` | `base64 -w0 your.jks` |
 | `KEYSTORE_PASSWORD` | keystore password |
 | `KEY_ALIAS` | key alias |
 | `KEY_PASSWORD` | key password |
 
-```bash
-keytool -genkeypair -v -keystore release.jks -alias imagen -keyalg RSA -keysize 2048 -validity 10000
-```
+Switching to a different key later means uninstalling the app once (Android refuses updates signed
+with a different key).

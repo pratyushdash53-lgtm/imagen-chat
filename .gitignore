@@ -10,3 +10,6 @@
 .cxx/
 *.jks
 *.keystore
+
+# Personal-use signing key is bundled on purpose (see README)
+!signing/*.jks

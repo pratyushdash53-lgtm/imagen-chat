@@ -5,6 +5,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
 import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.content.ContextCompat
@@ -13,6 +14,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
@@ -23,6 +26,7 @@ import kotlinx.coroutines.launch
 class GenerationService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
     private var observing = false
     private var lastStartId = 0
 
@@ -37,7 +41,7 @@ class GenerationService : Service() {
         try {
             startForeground(
                 Notifications.PROGRESS_ID,
-                Notifications.progress(this, manager.running.value.size.coerceAtLeast(1)),
+                Notifications.progress(this, manager.running.value),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
             )
         } catch (e: Exception) {
@@ -45,7 +49,7 @@ class GenerationService : Service() {
             stopSelf(startId)
             return START_NOT_STICKY
         }
-        acquireWakeLock()
+        acquireLocks()
 
         if (!observing) {
             observing = true
@@ -54,29 +58,53 @@ class GenerationService : Service() {
                 manager.running.collect { running ->
                     if (running.isEmpty()) {
                         stopForeground(STOP_FOREGROUND_REMOVE)
+                        notifications.cancel(Notifications.PROGRESS_ID)
                         // Only stops if no newer start request arrived in the meantime.
                         stopSelf(lastStartId)
                     } else {
-                        notifications.notify(Notifications.PROGRESS_ID, Notifications.progress(this@GenerationService, running.size))
+                        notifications.notify(Notifications.PROGRESS_ID, Notifications.progress(this@GenerationService, running))
                     }
+                }
+            }
+            // Watchdog: if a job ever disappears without reporting, don't leave the notification stuck.
+            scope.launch {
+                while (isActive) {
+                    delay(30_000)
+                    manager.reconcile()
                 }
             }
         }
         return START_NOT_STICKY
     }
 
-    private fun acquireWakeLock() {
-        if (wakeLock?.isHeld == true) return
-        val power = getSystemService(PowerManager::class.java)
-        wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "imagen:generation").apply {
-            setReferenceCounted(false)
-            acquire(15 * 60_000L) // safety net; released as soon as the service stops
+    private fun acquireLocks() {
+        if (wakeLock?.isHeld != true) {
+            val power = getSystemService(PowerManager::class.java)
+            wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "imagen:generation").apply {
+                setReferenceCounted(false)
+                acquire(20 * 60_000L) // safety net; released as soon as the service stops
+            }
+        }
+        // Without this, Wi-Fi can drop into power-save with the screen off and throttle a long request.
+        if (wifiLock?.isHeld != true) {
+            try {
+                val wifi = applicationContext.getSystemService(WifiManager::class.java)
+                wifiLock = wifi?.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "imagen:generation")?.apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+            } catch (e: Exception) {
+                // Best effort.
+            }
         }
     }
 
     override fun onDestroy() {
         scope.cancel()
         wakeLock?.let { if (it.isHeld) it.release() }
+        wifiLock?.let { if (it.isHeld) it.release() }
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        getSystemService(NotificationManager::class.java)?.cancel(Notifications.PROGRESS_ID)
         super.onDestroy()
     }
 

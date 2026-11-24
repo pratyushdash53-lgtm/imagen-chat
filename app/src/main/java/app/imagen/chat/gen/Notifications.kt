@@ -47,7 +47,10 @@ object Notifications {
         )
     }
 
-    fun progress(context: Context, count: Int): android.app.Notification {
+    fun progress(context: Context, running: Map<String, RunInfo>): android.app.Notification {
+        val count = running.size.coerceAtLeast(1)
+        val oldest = running.values.minByOrNull { it.startedAt }
+        val detail = if (count > 1) "$count images in progress" else (oldest?.stage ?: "Starting")
         val cancel = PendingIntent.getService(
             context,
             1,
@@ -56,8 +59,12 @@ object Notifications {
         )
         return NotificationCompat.Builder(context, CHANNEL_PROGRESS)
             .setSmallIcon(R.drawable.ic_stat_sparkle)
-            .setContentTitle(if (count > 1) "Generating $count images" else "Generating your image")
-            .setContentText("You can leave the app. We'll let you know when it's ready.")
+            .setContentTitle(if (count > 1) "Generating images" else "Generating your image")
+            .setContentText("$detail \u00B7 you can leave the app")
+            // A running timer shows the work is alive, so the notification never looks frozen.
+            .setUsesChronometer(true)
+            .setShowWhen(true)
+            .setWhen(oldest?.startedAt ?: System.currentTimeMillis())
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setProgress(0, 0, true)

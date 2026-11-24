@@ -29,6 +29,7 @@ class ImagenApp : Application() {
             override fun onActivityStarted(activity: Activity) {
                 startedActivities++
                 manager.appInForeground = true
+                manager.reconcile()
             }
 
             override fun onActivityStopped(activity: Activity) {
